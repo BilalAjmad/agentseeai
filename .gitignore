@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.livedesk_stop
+.livedesk_actions.log
+.livedesk_events.jsonl
+livedesk_last.png
+.DS_Store
+*.egg-info/
+dist/
+build/

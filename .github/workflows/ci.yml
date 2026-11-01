@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb openbox xterm wmctrl xdotool tesseract-ocr python3-tk x11-utils xclip gnome-screenshot scrot
+      - name: Install python deps
+        run: |
+          pip install -e "." && pip install pytest pytest-xvfb
+      - name: Run tests under Xvfb
+        run: |
+          pkill -f Xvfb || true
+          sleep 1
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
+          XVFB_PID=$!
+          sleep 3
+          xdpyinfo -display :99 | grep -i depth || true
+          openbox &
+          sleep 1
+          xterm -geometry 80x24+10+10 &
+          sleep 2
+          pytest -q
+          kill  || true
+
+  windows-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install mss pyautogui pillow pyperclip pynput
+      - name: Import check
+        run: python -c "import agentseeai; print('import ok')"
+
+  macos-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install mss pyautogui pillow pyperclip pynput
+      - name: Import check
+        run: python -c "import agentseeai; print('import ok')"

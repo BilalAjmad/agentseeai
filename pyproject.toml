@@ -1,0 +1,66 @@
+[project]
+name = "agentseeai"
+version = "0.1.0"
+description = "Agentseeai - eyes and hands for ANY AI agent. No AI and no API key inside."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Agentseeai Contributors"}
+]
+keywords = ["computer-use", "mcp", "automation", "accessibility", "ai-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+dependencies = [
+    "mcp>=2.1.0",
+    "mss>=9.0.0",
+    "pyautogui>=0.9.54",
+    "pillow>=10.0.0",
+    "pyperclip>=1.8.0",
+    "pynput>=1.8.0",
+]
+
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10"]
+windows = ["comtypes>=1.2.0", "pywinauto>=0.6.8", "uiautomation>=2.0.0", "psutil>=5.9.0"]
+macos = ["atomacos>=0.1.0"]
+linux = ["pyatspi2>=2.46.0", "python-xlib>=0.31"]
+cv = ["opencv-python>=4.11.0", "numpy>=1.26.0"]
+dev = ["pytest>=8.0.0", "pytest-xvfb>=1.0.0", "ruff>=0.6.0", "mypy>=1.10.0"]
+all = ["pytesseract>=0.3.10", "opencv-python>=4.11.0", "numpy>=1.26.0", "comtypes>=1.2.0", "pywinauto>=0.6.8", "uiautomation>=2.0.0", "psutil>=5.9.0", "atomacos>=0.1.0", "pyatspi2>=2.46.0", "python-xlib>=0.31"]
+
+[project.scripts]
+agentseeai = "agentseeai:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM", "T20", "PIE"]
+ignore = ["E501", "SIM103"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.setuptools]
+py-modules = ["agentseeai"]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
