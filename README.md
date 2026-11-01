@@ -1,6 +1,21 @@
-# Agentseeai
+# agentseeai
+
+![banner](banner.png)
+
+[![CI](https://github.com/BilalAjmad/agentseeai/actions/workflows/ci.yml/badge.svg)](https://github.com/BilalAjmad/agentseeai/actions)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/BilalAjmad/agentseeai?style=social)](https://github.com/BilalAjmad/agentseeai)
 
 **Eyes and hands for any AI agent. No brain inside.**
+
+## Quick demo (3 lines)
+
+```bash
+pip install mss pyautogui pillow pyperclip pynput
+python agentseeai.py doctor
+python agentseeai.py shot
+```
 
 Agentseeai has NO brain. It does NOT think, does NOT decide, does NOT have an AI. It is only the body: it gives your AI agent full eyes (see the screen) and full hands (do anything on the computer). With Agentseeai, your AI can do ANYTHING a human can do on a computer - open apps, browse the web, fill forms, edit files, manage windows, copy/paste, click buttons, type text, read the screen, and more. The AI agent you already use (Claude, Codex, Gemini CLI, Cursor, or a local model) is the brain that decides what to do. Agentseeai is just the eyes and hands that execute it. No AI, no API key, no cloud inside Agentseeai.
 
