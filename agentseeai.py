@@ -56,7 +56,8 @@ SCOPE (real desktop, no sandbox needed)
     - Not 60 fps video: agent thinking time is seconds per STEP,
       but each individual eye/hand operation is now milliseconds.
 """
-VERSION = "2.0.0"
+VERSION = "2.1.0"
+__version__ = VERSION
 BUILD_DATE = "2026-11-21"
 
 import hashlib, hmac, inspect, io, json, logging, os, secrets, socket, subprocess, sys, tempfile, threading, time
