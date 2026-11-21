@@ -56,7 +56,7 @@ SCOPE (real desktop, no sandbox needed)
     - Not 60 fps video: agent thinking time is seconds per STEP,
       but each individual eye/hand operation is now milliseconds.
 """
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 __version__ = VERSION
 BUILD_DATE = "2026-11-21"
 
@@ -861,6 +861,24 @@ def guard_look():
             raise RuntimeError("Mouse in screen corner: ABORT")
 
 
+def _foreground_app_name() -> str:
+    """Best-effort name of the foreground application (lowercase)."""
+    try:
+        if sys.platform == "win32":
+            import win32gui, win32process, psutil
+            hwnd = win32gui.GetForegroundWindow()
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return psutil.Process(pid).name().lower()
+        if sys.platform == "darwin":
+            from AppKit import NSWorkspace
+            return NSWorkspace.sharedWorkspace().frontmostApplication().localizedName().lower()
+        import subprocess
+        out = subprocess.check_output(["xdotool", "getwindowfocus", "getwindowname"], text=True, stderr=subprocess.DEVNULL)
+        return out.strip().lower()
+    except Exception:
+        return ""
+
+
 def check_app_allowed():
     if not CFG["allowlist"] and not CFG["denylist"]:
         return True
@@ -904,6 +922,23 @@ def act(fn, settle=None, no_look: bool = False):
     guard()
     if not check_app_allowed():
         raise RuntimeError("Current app is denylisted or not in allowlist.")
+    # require_confirm gating: apps in this list need human approval
+    try:
+        name = _foreground_app_name()
+        rc = [r.lower() for r in (CFG.get("require_confirm") or [])]
+        if name and any(r in name for r in rc):
+            try:
+                _, amsg = ask_approval(f"Confirm action on '{name}'?", timeout=15.0)
+                if "denied" in str(amsg).lower() or "timeout" in str(amsg).lower():
+                    raise RuntimeError("Action not confirmed by human.")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass  # viewer unavailable -> proceed
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
     _E.invalidate()  # action screen badal deta hai — purani image jhoot bolegi
     fn()
     pag = _pyautogui()
@@ -1149,7 +1184,11 @@ def read_screen(x: int = None, y: int = None, w: int = None, h: int = None):
     if x is not None and y is not None and w and h:
         text = _OCR.region_text(img, (x, y, w, h))
         return img, f"OCR region({x},{y},{w},{h}) ({len(text)} chars):\n{text[:4000]}"
-    text = _OCR.text(img)
+    try:
+        raw = _E.raw()
+        text = _OCR.text(raw)
+    except Exception:
+        text = _OCR.text(img)
     return img, f"OCR ({len(text)} chars):\n{text[:4000]}"
 
 
