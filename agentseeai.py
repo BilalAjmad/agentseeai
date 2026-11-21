@@ -302,7 +302,7 @@ class FrameEngine:
             try:
                 s = self._grabber()
                 mons = s.monitors
-                idx = MONITOR_IDX
+                idx = self._mon_idx if self._mon_idx is not None else MONITOR_IDX
                 mon = region or (
                     mons[idx] if 1 <= idx < len(mons) else (mons[1] if len(mons) > 1 else mons[0])
                 )
@@ -343,13 +343,13 @@ class FrameEngine:
                 and (monitor_idx is None or monitor_idx == self._mon_idx)
             ):
                 return self._img
+            self._mon_idx = monitor_idx if monitor_idx is not None else MONITOR_IDX
             raw = self.grab()
             w = min(MAXW, raw.width)
             img = raw.resize((w, round(raw.height * w / raw.width)))
             self._img = img
             self._raw = raw
             self._ts = time.time()
-            self._mon_idx = MONITOR_IDX if monitor_idx is None else monitor_idx
             self._out[:] = [img.width, img.height]
             return img
 
@@ -448,7 +448,7 @@ class OCREngine:
     def _tess_words(self, img) -> List[dict]:
         import pytesseract
         gray = img.convert("L")
-        if gray.width < 1000:
+        if gray.width < 1300:
             gray = gray.resize((gray.width * 2, gray.height * 2))
             scale = 2.0
         else:
@@ -2024,6 +2024,10 @@ def _mcp_call(name: str, arguments: dict) -> dict:
         img, msg = fn(**arguments)
     except Exception as e:
         return {"content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}
+    try:
+        log_action(name, arguments, msg, changed=_extract_changed(msg))
+    except Exception:
+        pass
     content = [{"type": "text", "text": str(msg)}]
     if img is not None:
         content.append({"type": "image", "data": _b64.b64encode(encode(img, "PNG")).decode(), "mimeType": "image/png"})
