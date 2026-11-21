@@ -830,7 +830,7 @@ def guard():
     pag = _pyautogui()
     cur = pag.position()
     if CFG["mouse_abort_corner"]:
-        W, H = pyautogui.size()
+        W, H = pag.size()
         corners = [(cur.x < 10 and cur.y < 10), (cur.x > W - 10 and cur.y < 10),
                    (cur.x < 10 and cur.y > H - 10), (cur.x > W - 10 and cur.y > H - 10)]
         if any(corners):
@@ -854,7 +854,7 @@ def guard_look():
     pag = _pyautogui()
     cur = pag.position()
     if CFG["mouse_abort_corner"]:
-        W, H = pyautogui.size()
+        W, H = pag.size()
         corners = [(cur.x < 10 and cur.y < 10), (cur.x > W - 10 and cur.y < 10),
                    (cur.x < 10 and cur.y > H - 10), (cur.x > W - 10 and cur.y > H - 10)]
         if any(corners):
@@ -921,7 +921,7 @@ def act(fn, settle=None, no_look: bool = False):
 
 # ---------------------------------------------------------------- hands (v1 API + speed)
 def screenshot():
-    guard()
+    guard_look()
     img = _E.frame(fresh=True)
     pct = _E.change(img, commit=False)
     return img, f"image {img.width}x{img.height}. changed {pct}% since last look"
@@ -1044,7 +1044,7 @@ def cursor_position():
 
 def wait_change(timeout: float = 5.0):
     """v2: early-exit poll (fixed interval nahi) + har poll pe cached compare."""
-    guard()
+    guard_look()
     base = _prev[0]
     end = time.time() + float(timeout)
     last_pct = 0.0
@@ -1064,7 +1064,7 @@ def wait_change(timeout: float = 5.0):
 
 def wait_for_text(text: str, timeout: float = 10.0, interval: float = 0.5, region: str = ""):
     """v2: OCR + AX dono check + optional region 'x,y,w,h' (10x faster)."""
-    guard()
+    guard_look()
     q = text.lower()
     box = _parse_region(region) if region else None
     end = time.time() + float(timeout)
@@ -1144,7 +1144,7 @@ def _parse_region(region: str) -> Optional[Tuple[int, int, int, int]]:
 
 def read_screen(x: int = None, y: int = None, w: int = None, h: int = None):
     """v2: region OCR optional (sirf us hisse ki padhai — 5-10x faster)."""
-    guard()
+    guard_look()
     img = _E.frame()
     if x is not None and y is not None and w and h:
         text = _OCR.region_text(img, (x, y, w, h))
@@ -1163,7 +1163,7 @@ def _scaled_word_center(word, img):
 
 def find_text(query: str, top: int = 3):
     """v2: AX + OCR + fuzzy, top matches with coords (clickable)."""
-    guard()
+    guard_look()
     img = _E.frame()
     matches: List[str] = []
 
@@ -1296,7 +1296,7 @@ def find_color(r: int, g: int, b: int, tol: int = 16, region: str = ""):
 
 
 def elements():
-    guard()
+    guard_look()
     nodes = ax_tree()
     text = ax_to_text(nodes)
     img = _E.frame()
@@ -1305,7 +1305,7 @@ def elements():
 
 # ---------------------------------------------------------------- windows / apps
 def windows():
-    guard()
+    guard_look()
     out = []
     if sys.platform == "win32":
         try:
@@ -1449,7 +1449,7 @@ def clip_set(text: str):
 
 
 def screens():
-    guard()
+    guard_look()
     mons = get_monitors()
     img = _E.frame()
     return img, json.dumps(mons, indent=2)
@@ -1466,7 +1466,7 @@ def set_screen(idx: int):
 
 
 def status():
-    guard()
+    guard_look()
     img = _E.frame()
     info = {
         "version": VERSION,
