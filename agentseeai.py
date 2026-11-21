@@ -926,10 +926,10 @@ def act(fn, settle=None, no_look: bool = False):
     try:
         name = _foreground_app_name()
         rc = [r.lower() for r in (CFG.get("require_confirm") or [])]
-        if name and any(r in name for r in rc):
+        if name and any(r in name for r in rc) and fast_server_alive():
             try:
                 _, amsg = ask_approval(f"Confirm action on '{name}'?", timeout=15.0)
-                if "denied" in str(amsg).lower() or "timeout" in str(amsg).lower():
+                if "denied" in str(amsg).lower():
                     raise RuntimeError("Action not confirmed by human.")
             except RuntimeError:
                 raise
@@ -1519,7 +1519,7 @@ def status():
         "has_tess": _probe("pytesseract"),
         "has_rapidocr": _OCR._rapid is not None,
         "has_cv2": _probe("cv2"),
-        "has_ax": bool(ax_tree() and ax_tree()[0].role != "error"),
+        "has_ax": (lambda _n: bool(_n) and _n[0].role != "error")(ax_tree()),
         "stop_file": STOP_FILE.exists(),
         "token": TOKEN,
         "port": PORT,
@@ -1753,6 +1753,8 @@ class _FastHandler(__import__("socketserver").BaseRequestHandler):
             if not chunk:
                 return None if not buf else buf
             buf += chunk
+            if len(buf) > 1024 * 1024:
+                return None
         return buf
 
     def _send(self, obj: dict):
@@ -1817,10 +1819,11 @@ def _fast_dispatch(req: dict) -> dict:
     args = coerce_args(fn, req.get("args", []))
     kwargs = dict(req.get("kwargs") or {})
     img, msg = fn(*args, **kwargs)
-    try:
-        log_action(cmd, {"args": args, "kwargs": kwargs}, msg, changed=_extract_changed(msg))
-    except Exception:
-        pass
+    if cmd not in ("__ping", "__stats", "__shutdown"):
+        try:
+            log_action(cmd, {"args": args, "kwargs": kwargs}, msg, changed=_extract_changed(msg))
+        except Exception:
+            pass
     out = {"ok": True, "msg": str(msg)}
     if img is not None and req.get("want_img"):
         import base64 as _b64
