@@ -86,7 +86,7 @@ DEFAULT_CONFIG = {
     "ocr_lang": "eng",
     "ocr_engine": "auto",         # auto | rapidocr | tesseract | off
     # --- misc v1 ---
-    "change_threshold": 1.5,
+    "change_threshold": 0.5,
     "jpeg_quality": 60,
     "stream_fps": 6,
     "log_actions": True,
@@ -125,6 +125,7 @@ log = logging.getLogger("agentseeai")
 
 # shared state
 _lock = threading.RLock()
+_rate_lock = threading.Lock()
 _prev = [None]            # last committed thumbnail (change detection)
 _mouse = [None]          # last known mouse pos (human-move detection)
 _session_log: List[dict] = []
@@ -220,26 +221,42 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()[:12]
 
 
-def log_action(action, params, result):
-    entry = {"t": time.time(), "action": action, "params": params, "result": (result or "")[:200]}
+_SENSITIVE = {"type_text", "clip_set", "type", "clip"}
+
+def log_action(action, params, result, changed=None):
+    safe_params = "[redacted]" if action in _SENSITIVE else params
+    entry = {"t": time.time(), "action": action, "params": safe_params, "result": (result or "")[:200]}
     _session_log.append(entry)
     if CFG["log_actions"]:
-        log.info(f"{action}({params}) -> {str(result)[:120]}")
+        log.info(f"{action}({safe_params}) -> {str(result)[:120]}")
     try:
         with open(EVENTS_PATH, "a") as f:
-            f.write(json.dumps({"t": entry["t"], "action": action, "changed": None}) + "\n")
+            f.write(json.dumps({"t": entry["t"], "action": action, "changed": changed}) + "\n")
     except Exception:
         pass
 
 
+
+def _extract_changed(msg: str):
+    import re as _re
+    m = _re.search(r"changed\s+(\d+\.?\d*)%", str(msg or ""))
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 def check_rate_limit():
-    now = time.time()
-    window = [t for t in _action_times if now - t < 60]
-    if len(window) >= CFG["max_actions_per_minute"]:
-        raise RuntimeError(f"Rate limit: {CFG['max_actions_per_minute']} actions/min exceeded. Wait.")
-    _action_times.append(now)
-    while len(_action_times) > 400:
-        _action_times.pop(0)
+    with _rate_lock:
+        now = time.time()
+        window = [t for t in _action_times if now - t < 60]
+        if len(window) >= CFG["max_actions_per_minute"]:
+            raise RuntimeError(f"Rate limit: {CFG['max_actions_per_minute']} actions/min exceeded. Wait.")
+        _action_times.append(now)
+        while len(_action_times) > 200:
+            _action_times.pop(0)
 
 
 # ---------------------------------------------------------------- FrameEngine
@@ -259,6 +276,7 @@ class FrameEngine:
         self._ts = 0.0
         self._mon_idx = None
         self._out = [0, 0]           # scaled size (v1 compat global)
+        self._mon_bounds = (0, 0, 1280, 800)  # (left, top, width, height) of captured monitor
 
     # -- mss lifecycle ---------------------------------------------------
     def _grabber(self):
@@ -288,6 +306,7 @@ class FrameEngine:
                     mons[idx] if 1 <= idx < len(mons) else (mons[1] if len(mons) > 1 else mons[0])
                 )
                 raw = s.grab(mon)
+                self._mon_bounds = (int(mon["left"]), int(mon["top"]), int(mon["width"]), int(mon["height"]))
                 return PIL.Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
             except Exception:
                 self._reset()
@@ -343,7 +362,7 @@ class FrameEngine:
 
     # -- change detection ----------------------------------------------------
     def thumb(self, img):
-        return img.resize((96, 54)).convert("L").tobytes()
+        return img.resize((160, 90)).convert("L").tobytes()
 
     def change(self, img, commit: bool = True) -> float:
         t, p = self.thumb(img), _prev[0]
@@ -454,7 +473,15 @@ class OCREngine:
     def _rapid_words(self, img) -> List[dict]:
         import numpy as np
         arr = np.array(img.convert("RGB"))[:, :, ::-1]  # RGB->BGR
-        result, _elapse = self._rapid(arr)
+        try:
+            out = self._rapid(arr)
+        except Exception:
+            out = None
+        # rapidocr versions differ: some return (result, elapse), some just result
+        if isinstance(out, tuple):
+            result = out[0]
+        else:
+            result = out
         words = []
         if result:
             for box, text, score in result:
@@ -464,7 +491,7 @@ class OCREngine:
                     words.append({
                         "w": str(text), "x": min(xs), "y": min(ys),
                         "w_px": max(xs) - min(xs), "h_px": max(ys) - min(ys),
-                        "conf": float(score),
+                        "conf": float(score) if score is not None else 90.0,
                     })
                 except Exception:
                     continue
@@ -477,9 +504,18 @@ class OCREngine:
         if hit is not None:
             return hit
         engine = self._pick()
+        words = []
         try:
             if engine == "rapidocr":
-                words = self._rapid_words(img)
+                try:
+                    words = self._rapid_words(img)
+                except Exception:
+                    # fallback to tesseract if rapidocr breaks
+                    if _probe("pytesseract"):
+                        engine = "tesseract"
+                        words = self._tess_words(img)
+                    else:
+                        raise
             elif engine == "tesseract":
                 words = self._tess_words(img)
             else:
@@ -706,7 +742,7 @@ def _ax_walk() -> List:
         except Exception as e:
             log.warning(f"AT-SPI error: {e}")
 
-    interactive = {"button", "link", "menuitem", "checkbox", "radiobutton", "slider", "textbox", "combobox", "listitem", "tab", "pushbutton", "menu", "text", "edit", "document", "pane", "window", "dialog", "alert", "label", "image", "hyperlink", "dataitem", "treeitem"}
+    interactive = {"button", "link", "menuitem", "checkbox", "radiobutton", "slider", "textbox", "combobox", "listitem", "tab", "pushbutton", "menu", "text", "edit", "document", "dialog", "alert", "label", "hyperlink", "dataitem", "treeitem"}
 
     def _norm_role(r):
         r = (r or "").lower()
@@ -750,22 +786,37 @@ def ax_to_text(nodes, max_lines=300):
 
 
 def find_element(nodes, query):
-    """v1 exact/word containment + v2 fuzzy fallback."""
-    q = query.lower()
-    for n in nodes:
-        if q in n.name.lower() or q in n.value.lower() or q in n.id.lower():
+    """Best-match element by name/value. Enabled + visible only. No id matching."""
+    q = (query or "").lower().strip()
+    if not q:
+        return None
+    candidates = [n for n in nodes if getattr(n, "enabled", True)]
+    # exact name match
+    for n in candidates:
+        if (n.name or "").lower() == q:
             return n
-    for n in nodes:
-        if any(w in n.name.lower() for w in q.split() if len(w) > 2):
+    # name contains full query
+    for n in candidates:
+        if q in (n.name or "").lower():
             return n
-    # v2: fuzzy — "Logn" bhi "Login" dhundh leta hai
+    # value contains full query
+    for n in candidates:
+        if q in (n.value or "").lower():
+            return n
+    # word containment (all query words present in name)
+    words = [w for w in q.split() if len(w) > 2]
+    if words:
+        for n in candidates:
+            nl = (n.name or "").lower()
+            if all(w in nl for w in words):
+                return n
+    # fuzzy best match by name (threshold higher to avoid wrong picks)
     best, best_score = None, 0.0
-    for n in nodes:
-        for field in (n.name, n.value):
-            score = _ratio(q, (field or "").lower())
-            if score > best_score:
-                best, best_score = n, score
-    if best is not None and best_score >= 55.0:
+    for n in candidates:
+        score = _ratio(q, (n.name or "").lower())
+        if score > best_score:
+            best, best_score = n, score
+    if best is not None and best_score >= 70.0:
         return best
     return None
 
@@ -778,9 +829,9 @@ def guard():
     pag = _pyautogui()
     cur = pag.position()
     if CFG["mouse_abort_corner"]:
-        W, H = pag.size()
-        corners = [(cur.x < 50 and cur.y < 50), (cur.x > W - 50 and cur.y < 50),
-                   (cur.x < 50 and cur.y > H - 50), (cur.x > W - 50 and cur.y > H - 50)]
+        W, H = pyautogui.size()
+        corners = [(cur.x < 10 and cur.y < 10), (cur.x > W - 10 and cur.y < 10),
+                   (cur.x < 10 and cur.y > H - 10), (cur.x > W - 10 and cur.y > H - 10)]
         if any(corners):
             raise RuntimeError("Mouse in screen corner: ABORT")
     if _mouse[0] and abs(cur.x - _mouse[0][0]) + abs(cur.y - _mouse[0][1]) > CFG["mouse_pause_threshold"]:
@@ -792,6 +843,21 @@ def guard():
                 last, quiet_since = now, time.time()
         _mouse[0] = (last.x, last.y)
         raise RuntimeError("The human used the mouse, so I paused. Take a new screenshot and re-plan.")
+
+
+def guard_look():
+    """Light guard for read-only operations: stop file + corner abort only.
+    Does NOT rate-limit or pause on mouse movement (those block looking)."""
+    if STOP_FILE.exists():
+        raise RuntimeError("Emergency stop file exists (~/.agentseeai_stop). Ask the human.")
+    pag = _pyautogui()
+    cur = pag.position()
+    if CFG["mouse_abort_corner"]:
+        W, H = pyautogui.size()
+        corners = [(cur.x < 10 and cur.y < 10), (cur.x > W - 10 and cur.y < 10),
+                   (cur.x < 10 and cur.y > H - 10), (cur.x > W - 10 and cur.y > H - 10)]
+        if any(corners):
+            raise RuntimeError("Mouse in screen corner: ABORT")
 
 
 def check_app_allowed():
@@ -818,7 +884,8 @@ def check_app_allowed():
                     return True
             return False
         return True
-    except Exception:
+    except Exception as e:
+        log.warning(f"check_app_allowed failed ({e}); allowing action (denylist inactive)")
         return True
 
 
@@ -826,10 +893,9 @@ def to_screen(x, y):
     with _lock:
         if not _E._out[0]:
             _E.frame()
-        pag = _pyautogui()
-        W, H = pag.size()
+        lb, tb, mw, mh = _E._mon_bounds
         ox, oy = _E._out[0], _E._out[1]
-    return round(x * W / ox), round(y * H / oy)
+    return round(x * mw / ox) + lb, round(y * mh / oy) + tb
 
 
 def act(fn, settle=None, no_look: bool = False):
@@ -901,8 +967,20 @@ def type_text(text: str, no_look: bool = False):
         pag = _pyautogui()
         if (len(text) >= CFG.get("clipboard_min_chars", 60)) or not text.isascii():
             import pyperclip
+            try:
+                old = pyperclip.paste()
+            except Exception:
+                old = None
             pyperclip.copy(text)
+            time.sleep(0.05)  # let clipboard settle before paste
             pag.hotkey("command" if sys.platform == "darwin" else "ctrl", "v")
+            time.sleep(0.05)
+            # restore clipboard (best effort)
+            try:
+                if old is not None:
+                    pyperclip.copy(old)
+            except Exception:
+                pass
         else:
             pag.write(text, interval=0)
     return act(go, no_look=no_look)
@@ -950,7 +1028,7 @@ def mouse_up(button: str = "left", x: int = None, y: int = None):
 
 
 def cursor_position():
-    guard()
+    guard_look()
     pag = _pyautogui()
     p = pag.position()
     if _E._out[0]:
@@ -1658,7 +1736,8 @@ class _FastHandler(__import__("socketserver").BaseRequestHandler):
                 continue
             t0 = time.time()
             try:
-                resp = _fast_dispatch(req)
+                with _lock:
+                    resp = _fast_dispatch(req)
             except Exception as e:
                 resp = {"ok": False, "msg": f"{type(e).__name__}: {e}"}
             resp["ms"] = round((time.time() - t0) * 1000.0, 2)
@@ -1698,6 +1777,10 @@ def _fast_dispatch(req: dict) -> dict:
     args = coerce_args(fn, req.get("args", []))
     kwargs = dict(req.get("kwargs") or {})
     img, msg = fn(*args, **kwargs)
+    try:
+        log_action(cmd, {"args": args, "kwargs": kwargs}, msg, changed=_extract_changed(msg))
+    except Exception:
+        pass
     out = {"ok": True, "msg": str(msg)}
     if img is not None and req.get("want_img"):
         import base64 as _b64
@@ -1890,6 +1973,10 @@ def run_cli(argv):
     fn = CLI_NAMES[cmd]
     args = coerce_args(fn, argv[1:])
     img, msg = fn(*args)
+    try:
+        log_action(cmd, {"args": args}, msg, changed=_extract_changed(msg))
+    except Exception:
+        pass
     _print_result(img, msg)
     return 0
 
