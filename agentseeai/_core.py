@@ -146,8 +146,12 @@ def load_config():
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_PATH)
 
 
 # ---------------------------------------------------------------- lazy deps
@@ -1125,17 +1129,16 @@ def wait_for_text(text: str, timeout: float = 10.0, interval: float = 0.5, regio
 def zoom(x: int, y: int, w: int = 200, h: int = 200):
     guard()
     _E.frame()
-    pag = _pyautogui()
-    W, H = pag.size()
+    lb, tb, mw, mh = _E._mon_bounds
     ox, oy = _E._out[0], _E._out[1]
-    cx = round(x * W / ox)
-    cy = round(y * H / oy)
-    cw = round(w * W / ox)
-    ch = round(h * H / oy)
-    left = max(0, cx - cw // 2)
-    top = max(0, cy - ch // 2)
-    right = min(W, left + cw)
-    bottom = min(H, top + ch)
+    cx = round(x * mw / ox) + lb
+    cy = round(y * mh / oy) + tb
+    cw = round(w * mw / ox)
+    ch = round(h * mh / oy)
+    left = max(lb, cx - cw // 2)
+    top = max(tb, cy - ch // 2)
+    right = min(lb + mw, left + cw)
+    bottom = min(tb + mh, top + ch)
     try:
         region = {"left": left, "top": top, "width": right - left, "height": bottom - top}
         zimg = _E.grab(region=region)
@@ -1581,6 +1584,7 @@ def execute_steps(steps: List[dict]) -> Tuple[Optional[Any], str]:
     for i, st in enumerate(steps):
         if not isinstance(st, dict):
             return img, f"step {i} not an object: {st!r}"
+        guard_look()
         cmd = st.get("cmd") or st.get("command") or ""
         fn = CLI_NAMES.get(cmd)
         if fn is None:

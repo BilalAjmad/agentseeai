@@ -19,8 +19,8 @@ agentseeai has NO brain. It does NOT think, does NOT decide, and does NOT contai
 
 ```bash
 pip install mss pyautogui pillow pyperclip
-python agentseeai.py doctor
-python agentseeai.py shot
+agentseeai doctor
+agentseeai shot
 ```
 
 ## Install (copy-paste, 3 steps)
@@ -72,8 +72,8 @@ pip install opencv-python numpy
 
 **Step 3 - Test it works:**
 ```
-python agentseeai.py doctor
-python agentseeai.py shot
+agentseeai doctor
+agentseeai shot
 ```
 
 Done. That is the whole install. No Docker, no sandbox, no cloud, no API key.
@@ -82,14 +82,14 @@ Done. That is the whole install. No Docker, no sandbox, no cloud, no API key.
 
 **Claude Code:**
 ```
-claude mcp add agentseeai -- python agentseeai.py mcp
+claude mcp add agentseeai -- agentseeai mcp
 ```
 
 **Cursor / Codex / Gemini CLI:** command = `python`, args = `["agentseeai.py", "mcp"]`.
 
 **Any agent with a terminal (no MCP needed):**
 ```
-python agentseeai.py shot
+agentseeai shot
 python agentseeai.py click 640 360
 python agentseeai.py type "hello"
 python agentseeai.py key ctrl+s
@@ -116,7 +116,7 @@ If the server is down, the CLI still runs in slow/local mode (full back-compat).
 ## Live viewer (watch in browser)
 
 ```
-python agentseeai.py view
+agentseeai view
 ```
 Prints `http://127.0.0.1:8765/?t=TOKEN`. Open in browser. STOP blocks all actions, Resume restores, Approve/Deny answer approval requests.
 
@@ -223,7 +223,7 @@ Controls your real desktop fully. Run elevated (Administrator) to also act on el
 ## Benchmark
 
 ```
-python agentseeai.py bench
+agentseeai bench
 ```
 Prints lazy-import time, frame fresh/cached time, OCR time, cache-hit time, and server round-trip. Run `agentseeai serve` first to measure the fast path.
 
@@ -231,7 +231,7 @@ Prints lazy-import time, frame fresh/cached time, OCR time, cache-hit time, and 
 
 ```
 cd agentseeai && python -m pytest tests/ -q
-python agentseeai.py doctor && python agentseeai.py bench
+agentseeai doctor && agentseeai bench
 ```
 19 tests, headless-safe (no display needed).
 
