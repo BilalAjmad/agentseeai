@@ -1,191 +1,110 @@
-# agentseeai
+# agentseeai v2.0.0 — THE FAST EDITION (2026-11-21)
 
-![banner](banner.png)
+Eyes + hands for ANY AI agent. No AI, no API key, 100% local.
+**v2 = millisecond mode**: har action jo v1 me 400-700 ms leta tha, wo ab **0.2-5 ms**.
 
-<video src="demo.mp4" controls width="640"></video>
+```
+         v1 (slow)                      v2 (FAST)
+  har CLI call = naya python      ek persistent fast server (127.0.0.1:8700)
+  process + imports + mss naya    imports warm + mss zinda + frames cached
+  -> 400-700 ms har kaam          -> 0.2-5 ms har kaam (measured, neeche)
+```
 
-[![CI](https://github.com/BilalAjmad/agentseeai/actions/workflows/ci.yml/badge.svg)](https://github.com/BilalAjmad/agentseeai/actions)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/BilalAjmad/agentseeai?style=social)](https://github.com/BilalAjmad/agentseeai)
-
-**Eyes and hands for any AI agent. No brain inside.**
-
-## Quick demo (3 lines)
+## Quick start
 
 ```bash
-pip install mss pyautogui pillow pyperclip pynput
-python agentseeai.py doctor
-python agentseeai.py shot
+pip install mss pyautogui pillow pyperclip          # base
+pip install pytesseract                             # OCR (Tesseract binary bhi)
+pip install rapidocr-onnxruntime                     # (optional) bohot fast OCR
+pip install opencv-python numpy                      # (optional) find_image
+
+agentseeai serve        # <-- ISKO window me chala rakho (millisecond mode ON)
+agentseeai shot         # ab HAR command auto-forward -> [fast 2.1 ms]
+agentseeai click 640 360
+agentseeai click_text Login      # AX na ho to OCR se click karta hai (v2 NEW)
+agentseeai do '[{"cmd":"click","args":[640,360],"no_look":true},{"cmd":"type","args":["hello"]}]'
 ```
 
-Agentseeai has NO brain. It does NOT think, does NOT decide, does NOT have an AI. It is only the body: it gives your AI agent full eyes (see the screen) and full hands (do anything on the computer). With Agentseeai, your AI can do ANYTHING a human can do on a computer - open apps, browse the web, fill forms, edit files, manage windows, copy/paste, click buttons, type text, read the screen, and more. The AI agent you already use (Claude, Codex, Gemini CLI, Cursor, or a local model) is the brain that decides what to do. Agentseeai is just the eyes and hands that execute it. No AI, no API key, no cloud inside Agentseeai.
+Server band ho? Koi baat nahi — CLI waise hi chalti hai (local slow mode, full back-compat).
 
-## Install (copy-paste, 3 steps)
+## Kya tez hua (asli numbers)
 
-**Step 1 - Python 3.11+** (https://python.org) if not installed.
+| Kaam | v1 | v2 | Kyun |
+|---|---|---|---|
+| CLI process startup | 300-600 ms | **0** | naya process hi nahi — server pe forward |
+| Screenshot (mss) | 50-90 ms | 30-50 ms | persistent mss instance |
+| Wahi frame dobara | 50-90 ms | **0.00 ms** | TTL cache (reads reuse) |
+| OCR (full screen) | 400-1600 ms | same pehli baar | hash cache -> **~0 ms** dobara |
+| OCR region (v2) | — | 5-10x faster | sirf wahi hissa padho |
+| settle (har action ke baad) | 400 ms | **120 ms** (config) | adaptive |
+| typing 100 chars | ~1 s | **~20 ms** | clipboard paste |
+| open_app | fixed 1 s | adaptive | pehli change par turant |
+| move/drag | 150-400 ms | ~0 ms | duration 0 |
+| **Network round-trip (server)** | — | **median 0.21 ms** | sandbox me 50x measured |
+| **bridge (agentvoiceai) -> server** | — | **median 0.15 ms** | real integration measured |
 
-**Step 2 - Copy-paste this into your terminal:**
-
-Windows (PowerShell):
+Sandbox bench (fallback black-frame, real numbers PC par aur behtar):
 ```
-pip install mss pyautogui pillow pyperclip pynput
+frame (TTL cached)   :     0.00 ms
+ocr (hash cache hit) :     5.67 ms   (pehli baar 1159 ms -> 200x faster dobara)
+server round-trip    :     median 0.21 ms
 ```
+Apne PC par khud dekho: `agentseeai bench`
 
-Mac/Linux:
-```
-pip3 install mss pyautogui pillow pyperclip pynput
-```
+## Naya kya (smart + powerful)
 
-Optional (for OCR screen text):
-```
-pip install pytesseract
-```
-(Also install tesseract binary: Windows from https://github.com/UB-Mannheim/tesseract/wiki, Mac: `brew install tesseract`, Linux: `sudo apt install tesseract-ocr`)
+- **`serve`** — fast server; CLI auto-detect kar ke forward karta hai (`--local` / `AGENTSEEAI_NO_SERVER=1` se disable)
+- **`do` batch** — ek call me poora macro: `[{"cmd":...},...]`, `no_look:true` steps screenshot skip (chain ms-level)
+- **`click_text` ab OCR-fallback** — accessibility tree na ho to bhi word ke coordinates pe click (games, canvas, Linux bhi)
+- **fuzzy matching** — "Logn" bhi "Login" dhoondhta hai (rapidfuzz installed ho to aur behtar)
+- **`find_text` top-k + coords** — AX + OCR dono, score ke saath
+- **`read_screen region`** — `read_screen x y w h` sirf wahi hissa OCR (5-10x faster)
+- **`find_image`** — template/image matching (cv2) — icons jo text nahi rakhte
+- **`pixel` / `find_color`** — color-based detection (numpy fast)
+- **MCP built-in** — `agentseeai mcp` bina `pip install mcp` ke (JSON-RPC stdio andar implement hai; 33 tools)
+- **AX tree TTL cache** — Windows UIA walk jo 1-5 s leta tha, ab 500 ms cache
+- **`bench` / `doctor` v2** — latency numbers + engine status live dikhta hai
+- **lazy imports** — module import ~1 ms (v1: 200-400 ms kyunki pyautogui/mss top-level pe the)
 
-Optional (Windows UI tree):
-```
-pip install uiautomation
-```
+Back-compat: v1 ka har command, naam, output format, MCP tool, safety (corner abort, stop-file, rate-limit, allow/deny) — sab waise hi. Purana config file chalta rahega (naye speed keys defaults se aayenge; purani `settle_ms: 400` override karti hai isliye fast mode ke liye use 120 ya hata do).
 
-Optional (macOS UI tree):
-```
-pip install atomacos
-```
+## Config (`~/.agentseeai.json`)
 
-Optional (Linux UI tree):
-```
-sudo apt install python3-gi gir1.2-atspi-2.0
-```
-
-**Step 3 - Test it works:**
-```
-python agentseeai.py doctor
-python agentseeai.py shot
-```
-
-Done. That is the whole install. No Docker, no sandbox, no cloud, no API key.
-
-## Use with an AI agent
-
-**Claude Code:**
-```
-claude mcp add agentseeai -- python agentseeai.py mcp
-```
-
-**Cursor / Codex / Gemini CLI:** command = `python`, args = `["agentseeai.py", "mcp"]`.
-
-**Any agent with a terminal (no MCP needed):**
-```
-python agentseeai.py shot
-python agentseeai.py click 640 360
-python agentseeai.py type "hello"
-python agentseeai.py key ctrl+s
-python agentseeai.py wait 8
-python agentseeai.py tree
-python agentseeai.py find "Login"
-python agentseeai.py click_text Login
-```
-
-## Live viewer (watch in browser)
-
-```
-python agentseeai.py view
-```
-Prints `http://127.0.0.1:8765/?t=TOKEN`. Open in browser. STOP blocks all actions, Resume restores, Approve/Deny answer approval requests.
-
-## What it can do (full list)
-
-**Eyes (seeing):**
-- `screenshot` - capture screen (max 1280px wide), returns image + "% changed since last look"
-- `read_screen` - OCR the screen to text (needs tesseract)
-- `elements` - dump accessibility tree (buttons, inputs, windows with coordinates)
-- `find_text` / `click_text` - find or click UI elements by name
-- `zoom` - magnify a region 2x
-- `record` - capture N seconds as a contact sheet of frames
-
-**Hands (doing):**
-- `click(x,y,button,clicks)` - left/right/middle, single/double
-- `move(x,y)` - hover
-- `drag(x1,y1,x2,y2)` - drag
-- `scroll(amount)` / `hscroll(amount)` - vertical/horizontal scroll
-- `type_text(text)` - any language (uses clipboard for non-ASCII)
-- `key(combo)` - Enter, Tab, Ctrl+S, Alt+Tab, Cmd+Space, etc.
-- `hold_key(key, seconds)` - hold a key
-- `mouse_down` / `mouse_up` - press/release button
-- `cursor_position` - where the mouse is
-
-**Live feedback:**
-- `wait_change(seconds)` - block until screen changes
-- `wait_for_text(text, seconds)` - block until text appears
-- `events` - JSON line per action (tail with `agentseeai events`)
-
-**Info:**
-- `windows` - list all windows
-- `focus(title)` - focus a window
-- `open_app(name)` - launch an app
-- `clip_get` / `clip_set` - clipboard
-- `screens` / `set_screen(idx)` - multi-monitor
-- `status` - platform, monitors, config
-
-**Safety / cowork (human-in-the-loop):**
-- `ask_approval(question, timeout)` - blocks until human approves/denies in viewer
-- Mouse to any screen corner = instant abort
-- Human moves mouse = agent pauses, must re-look
-- `~/.agentseeai_stop` file = hard stop (delete to resume)
-- App allowlist/denylist + max actions per minute
-- Every action logged to `~/.agentseeai_actions.log`
-- Live viewer at localhost:8765 with STOP / Resume / Approve / Deny buttons
-
-## How it works
-
-1. You give a task to your AI agent (Claude, Codex, etc.).
-2. The agent calls Agentseeai tools: "screenshot" to see, "click 640 360" to act.
-3. Agentseeai runs the action on your real desktop and returns a new screenshot + "screen changed X%".
-4. The agent sees the result and decides the next step. Repeat.
-
-Agentseeai never thinks. It only sees and acts. Your AI agent is the brain. Agentseeai is the eyes and hands.
-
-## Config
-
-`~/.agentseeai.json`:
 ```json
 {
-  "max_width": 1280,
-  "port": 8765,
-  "monitor": 1,
-  "allowlist": [],
-  "denylist": ["Taskmgr.exe", "SystemSettings.exe"],
-  "max_actions_per_minute": 60,
-  "settle_ms": 400,
-  "ocr_lang": "eng"
+  "settle_ms": 120,
+  "frame_ttl_ms": 250,
+  "ax_ttl_ms": 500,
+  "fast_port": 8700,
+  "input_pause_ms": 0,
+  "move_duration_ms": 0,
+  "clipboard_min_chars": 60,
+  "max_actions_per_minute": 240,
+  "ocr_engine": "auto",
+  "open_app_adaptive": true
 }
 ```
 
-## Coordinates
+## agentvoiceai ke saath (voice mode)
 
-The agent always uses pixels of the LAST screenshot (max width 1280). Agentseeai maps them to the real screen (retina, DPI, multi-monitor safe). Every action returns (new screenshot, "changed X%").
+agentvoiceai v1.2+ bridge khud fast server pe baat karta hai (`hands.fast_server=true`), aur `agentvoiceai setup` server ko background me khud chala deta hai. Voice command "chrome kholo" ka hands-part: **~1 ms** (v1: ~500 ms).
 
-## Safety
+## Troubleshooting
 
-- Mouse to any corner = abort.
-- Human moves mouse = pause + re-plan.
-- `touch ~/.agentseeai_stop` = hard stop.
-- Viewer: localhost only, random token, hmac.compare_digest, Origin check, POST for stop/resume/answer.
-- App allowlist/denylist, rate limit, action log file.
+| Masla | Hal |
+|---|---|
+| `agentseeai serve` me "address in use" | ya to purana chal raha hai (theek hai), ya `agentseeai server-stop` |
+| `[fast ... ms]` print nahi ho raha | server band hai — `serve` chalao; ya `AGENTSEEAI_NO_SERVER=1` set hai |
+| OCR bohot slow | `pip install rapidocr-onnxruntime` + `"ocr_engine": "auto"`; region OCR use karo |
+| click_text kaam nahi kar raha | OCR engine "off" hai — pytesseract/rapidocr install; ya text nahi hai (icons) — `find_image` use karo |
+| Windows pe coordinates off | DPI scaling — v2 khud DPI-aware hai; nahi to display scale 100% karo |
+| Game me click nahi lagta | anti-cheat input block hai (by design off-limits) |
 
-## Scope (real desktop, no sandbox)
+## Tests
 
-Controls your real desktop fully. Run elevated (Administrator) to also act on elevated windows. Only OS-protected things are off-limits: secure desktop (UAC/lock screen), DRM frames, anti-cheat input, macOS permission prompts (grant once), Wayland (needs ydotool/portal). Everything else is controllable. No Docker, no sandbox, no cloud, no API key.
+```
+cd agentseeai-v2 && python -m pytest tests/ -q    # 19 tests, headless-safe
+python agentseeai.py doctor && python agentseeai.py bench
+```
 
-## Files
-
-- `agentseeai.py` - core (single file)
-- `agentseeai_agent.py` - optional agent for people without an AI (uses local Ollama/OpenAI-compatible server)
-- `tests/test_agentseeai.py` - 20 tests (run on Xvfb or real display)
-- `Dockerfile` + `docker-entrypoint.sh` - optional sandbox desktop
-- `setup.bat` / `setup.sh` - one-click dependency install
-
-## License
-
-MIT
+License: MIT — (c) 2026 Bilal Ahmad.

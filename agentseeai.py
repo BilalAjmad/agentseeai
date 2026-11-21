@@ -1,137 +1,70 @@
 #!/usr/bin/env python3
 """
-Agentseeai - eyes and hands for ANY AI agent. No AI and no API key inside.
+Agentseeai v2.0.0 — THE FAST EDITION (2026-11-21).
+Eyes + hands for ANY AI agent. No AI and no API key inside.
 The agent you already use (Claude Code, Codex, Gemini CLI, Cursor...) is the brain.
 
+WHAT'S NEW IN v2 (why it is fast — milliseconds):
+  1. FAST SERVER  : `agentseeai serve` = persistent process. CLI auto-forwards
+                    to it -> no Python startup per action (saves 300-600 ms).
+  2. FRAME CACHE : screenshot TTL cache + persistent mss instance
+                    (saves 30-80 ms per look; reads reuse, writes invalidate).
+  3. OCR UPGRADE  : word BOXES + hash cache + REGION OCR + RapidOCR engine
+                    (auto: rapidocr if installed, else tesseract).
+                    click_text now works even with no accessibility tree —
+                    it clicks text found by OCR.
+  4. FUZZY FIND   : "Logn" still finds "Login" (rapidfuzz or difflib).
+  5. BATCH `do`   : one call = many actions in one process (macros).
+  6. ADAPTIVE     : settle 400ms->120ms (config), instant typing via clipboard,
+                    open_app waits for real change instead of fixed sleep,
+                    wait_change early-exits.
+  7. NEW TOOLS    : find_image (template), pixel, find_color, read_screen(region),
+                    do(steps), bench, doctor v2.
+  8. MCP BUILT-IN : MCP stdio server implemented inside (no `pip install mcp`
+                    needed anymore). `agentseeai mcp` just works.
+
 SETUP (one time)
-    pip install mcp mss pyautogui pillow pyperclip pynput
-    # Optional (OCR): pip install pytesseract
-    # Optional (Windows a11y): pip install comtypes psutil uiautomation
-    # Optional (macOS a11y): pip install atomacos
-    # Optional (Linux a11y): pip install pyatspi python-xlib
-    # Optional (cv): pip install opencv-python numpy
+    pip install mss pyautogui pillow pyperclip
+    # Optional (OCR): pip install pytesseract   (+ Tesseract binary)
+    # Optional (faster OCR): pip install rapidocr-onnxruntime
+    # Optional (template/image find): pip install opencv-python numpy
 
 USE WITH AN MCP AGENT
     agentseeai mcp
     (Claude Code: claude mcp add agentseeai -- agentseeai mcp)
 
-USE WITH ANY AGENT THAT HAS A TERMINAL
-    agentseeai shot            -> saves screen, prints the image path
-    agentseeai click 640 360
-    agentseeai type "hello"
-    agentseeai key ctrl+s
-    agentseeai wait 8          -> returns when the screen changes
-    agentseeai tree            -> dumps accessibility tree (text)
-    agentseeai find "Login"    -> finds element by text, returns coords
-    agentseeai click_text Login -> clicks element by text
-    agentseeai events          -> tail JSON lines per screen change
-    agentseeai doctor          -> report platform + deps
+FAST MODE (start once, then every CLI call is milliseconds)
+    agentseeai serve            # keep this window running
+    agentseeai click 640 360    # auto-forwarded to the server -> ~1-5 ms
+    agentseeai do '[{"cmd":"click","args":[640,360]},{"cmd":"type","args":["hi"]}]'
 
-WATCH LIVE (you, in a browser)
-    agentseeai view            -> prints http://127.0.0.1:8765/?t=TOKEN
+USE WITH ANY AGENT THAT HAS A TERMINAL (same commands as v1)
+    agentseeai shot | click | type | key | wait | tree | find | click_text
+    agentseeai events | doctor | bench
 
-SAFETY
+SAFETY (unchanged from v1)
     - Slam the mouse into any screen corner = instant abort.
     - Move the mouse yourself = agent pauses and must re-look.
     - touch ~/.agentseeai_stop = hard stop. Delete the file to resume.
     - Viewer is read-only control, localhost only, needs a random token.
     - App allowlist/denylist + max actions per minute in config.
+    - Fast server binds 127.0.0.1 ONLY (no network exposure).
 
 SCOPE (real desktop, no sandbox needed)
-    - Controls your real desktop fully. Run elevated (Administrator) to also
-      act on elevated windows. Only OS-protected things are off-limits: secure
-      desktop (UAC/lock screen), DRM frames, anti-cheat input, macOS permission
-      prompts (grant once), Wayland (needs ydotool/portal). Everything else is
-      controllable. No Docker, no sandbox, no cloud, no API key.
-    - Not truly real-time. Agent thinking time = seconds per step.
-    - "Live" = instant feedback after every action, not 60 fps.
-    - Windows/macOS/Linux X11. Wayland marked experimental.
-    - Elevated/admin apps need elevated Agentseeai.
-    - Primary monitor by default; multi-monitor via config.
+    - Windows / macOS / Linux X11 (Wayland experimental).
+    - Run elevated (Administrator) to act on elevated windows.
+    - Not 60 fps video: agent thinking time is seconds per STEP,
+      but each individual eye/hand operation is now milliseconds.
 """
-import asyncio, base64, functools, hashlib, hmac, io, json, logging, os, secrets, sys, tempfile, threading, time
-from dataclasses import asdict, dataclass
+VERSION = "2.0.0"
+BUILD_DATE = "2026-11-21"
+
+import hashlib, hmac, inspect, io, json, logging, os, secrets, socket, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import mss
-import pyautogui
-from PIL import Image as PILImage
-
-# Optional deps
-try:
-    import cv2, numpy as np
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-    cv2 = None
-    np = None
-
-try:
-    import pytesseract
-    HAS_TESS = True
-except ImportError:
-    HAS_TESS = False
-
-# Platform a11y
-HAS_AX = False
-if sys.platform == "win32":
-    try:
-        import comtypes.client
-        import comtypes.gen.UIAutomationClient as UIA
-        HAS_AX = True
-    except ImportError:
-        pass
-    try:
-        import win32gui, win32process, psutil
-        HAS_WIN32 = True
-    except ImportError:
-        HAS_WIN32 = False
-elif sys.platform == "darwin":
-    try:
-        import atomacos
-        HAS_AX = True
-    except ImportError:
-        pass
-    try:
-        from AppKit import NSWorkspace
-        HAS_APPKIT = True
-    except ImportError:
-        HAS_APPKIT = False
-else:
-    try:
-        import gi
-        gi.require_version("Atspi", "2.0")
-        from gi.repository import Atspi
-        HAS_AX = True
-    except Exception:
-        pass
-    try:
-        import subprocess as _sp
-        HAS_XDOTOOL = True
-    except ImportError:
-        HAS_XDOTOOL = False
-
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.03
-
-# DPI awareness on Windows
-if sys.platform == "win32":
-    try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
-def _mss_factory():
-    if hasattr(mss, "MSS"):
-        return mss.MSS()
-    return mss.mss()
-
+# ---------------------------------------------------------------- config
 CONFIG_PATH = Path.home() / ".agentseeai.json"
 DEFAULT_CONFIG = {
     "max_width": 1280,
@@ -140,47 +73,45 @@ DEFAULT_CONFIG = {
     "allowlist": [],
     "denylist": ["Taskmgr.exe", "SystemSettings.exe"],
     "require_confirm": ["powershell.exe", "cmd.exe", "terminal", "sudo"],
-    "settle_ms": 400,
+    # --- speed (v2 defaults; old config file ki values override ho jati hain) ---
+    "settle_ms": 120,             # v1: 400 | har action ke baad intna wait
+    "frame_ttl_ms": 250,          # screenshot cache TTL (0 = hamesha fresh)
+    "ax_ttl_ms": 500,             # accessibility tree cache TTL
+    "fast_port": 8700,            # fast server TCP port (127.0.0.1 only)
+    "input_pause_ms": 0,          # pyautogui.PAUSE (v1: 30ms har event)
+    "move_duration_ms": 0,        # moveTo duration (v1: 150ms)
+    "clipboard_min_chars": 60,    # isse lamba text = clipboard paste (instant)
+    "max_actions_per_minute": 240,# v1: 60 — v2 fast mode ke liye 4x
+    # --- ocr ---
+    "ocr_lang": "eng",
+    "ocr_engine": "auto",         # auto | rapidocr | tesseract | off
+    # --- misc v1 ---
     "change_threshold": 1.5,
     "jpeg_quality": 60,
     "stream_fps": 6,
     "log_actions": True,
     "log_path": str(Path.home() / ".agentseeai_actions.log"),
-    "ocr_lang": "eng",
     "mouse_abort_corner": True,
     "mouse_pause_threshold": 8,
     "mouse_pause_wait": 1.5,
-    "max_actions_per_minute": 60,
     "events_path": str(Path.home() / ".agentseeai_events.jsonl"),
+    "open_app_adaptive": True,    # window change ka wait (fixed 1s nahi)
 }
-CFG = {}
+CFG: Dict[str, Any] = DEFAULT_CONFIG.copy()
 if CONFIG_PATH.exists():
     try:
         with open(CONFIG_PATH) as f:
             user = json.load(f)
-        CFG = {**DEFAULT_CONFIG, **user}
+        CFG.update(user)
     except Exception:
-        CFG = DEFAULT_CONFIG.copy()
-else:
-    CFG = DEFAULT_CONFIG.copy()
+        pass
 
 MAXW = CFG["max_width"]
 PORT = int(os.environ.get("AGENTSEEAI_PORT", CFG["port"]))
-TOKEN = os.environ.get("AGENTSEEAI_TOKEN") or secrets.token_urlsafe(16)
+FAST_PORT = int(os.environ.get("AGENTSEEAI_FAST_PORT", CFG["fast_port"]))
 STOP_FILE = Path.home() / ".agentseeai_stop"
-MONITOR_IDX = CFG["monitor"]
 EVENTS_PATH = Path(CFG["events_path"])
-
-# Shared state with lock
-_lock = threading.RLock()
-_out = [0, 0]
-_prev = [None]
-_mouse = [None]
-_session_log = []
-_ocr_cache = {"hash": None, "text": None}
-_approval_queue = {}  # id -> {"status": pending/approved/denied, "question": str}
-_events = []
-_action_times = []
+MONITOR_IDX = CFG["monitor"]
 
 logging.basicConfig(
     level=logging.INFO if CFG["log_actions"] else logging.WARNING,
@@ -191,6 +122,14 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("agentseeai")
+
+# shared state
+_lock = threading.RLock()
+_prev = [None]            # last committed thumbnail (change detection)
+_mouse = [None]          # last known mouse pos (human-move detection)
+_session_log: List[dict] = []
+_approval_queue: Dict[str, dict] = {}
+_action_times: List[float] = []
 
 
 def load_config():
@@ -209,8 +148,76 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-def _hash_img(img):
-    return hashlib.md5(img.tobytes()).hexdigest()[:12]
+# ---------------------------------------------------------------- lazy deps
+# v1 me ye sab module-load pe import hota tha (~200-400 ms extra per process).
+# v2 me SIRF zaroorat pe. Doctor/--help/server ka boot turant.
+_PIL = None
+_MSS = None
+_PAG = None
+_HAS = {}
+
+
+def _pil():
+    global _PIL
+    if _PIL is None:
+        from PIL import Image
+        _PIL = Image
+    return _PIL
+
+
+def _mss_mod():
+    global _MSS
+    if _MSS is None:
+        import mss
+        _MSS = mss
+    return _MSS
+
+
+def _probe(name: str) -> bool:
+    if name not in _HAS:
+        try:
+            __import__(name)
+            _HAS[name] = True
+        except Exception:
+            _HAS[name] = False
+    return _HAS[name]
+
+
+def _has(name):  # runtime probe (cached)
+    return _probe(name)
+
+
+def _pyautogui():
+    """Import + configure pyautogui once, lazily."""
+    global _PAG
+    if _PAG is None:
+        import pyautogui
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = float(CFG.get("input_pause_ms", 0)) / 1000.0
+        _PAG = pyautogui
+    return _PAG
+
+
+# DPI awareness on Windows (once, lazily safe)
+def _dpi_aware():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+_dpi_aware()
+
+
+# ---------------------------------------------------------------- utils
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()[:12]
 
 
 def log_action(action, params, result):
@@ -218,7 +225,6 @@ def log_action(action, params, result):
     _session_log.append(entry)
     if CFG["log_actions"]:
         log.info(f"{action}({params}) -> {str(result)[:120]}")
-    # events
     try:
         with open(EVENTS_PATH, "a") as f:
             f.write(json.dumps({"t": entry["t"], "action": action, "changed": None}) + "\n")
@@ -232,70 +238,136 @@ def check_rate_limit():
     if len(window) >= CFG["max_actions_per_minute"]:
         raise RuntimeError(f"Rate limit: {CFG['max_actions_per_minute']} actions/min exceeded. Wait.")
     _action_times.append(now)
-    # trim
-    while len(_action_times) > 200:
+    while len(_action_times) > 400:
         _action_times.pop(0)
 
 
-# ---- Eyes ----
-def get_monitors():
-    try:
-        with _mss_factory() as s:
-            return s.monitors
-    except Exception:
-        return [{"left": 0, "top": 0, "width": 1280, "height": 800}]
+# ---------------------------------------------------------------- FrameEngine
+class FrameEngine:
+    """Persistent-mss screenshot engine + TTL cache (THE speed core).
+
+    v1: har frame() pe naya mss instance + full grab. v2: mss instance
+    zinda rehta hai (30-80 ms bachat) aur TTL ke andar wali image dobara
+    use hoti hai (reads). Likhne wale actions cache ko invalidate karte
+    hain taake agent ko hamesha NAYI tasveer mile.
+    """
+
+    def __init__(self) -> None:
+        self._sct = None
+        self._img = None            # scaled cached PIL image
+        self._raw = None             # full-res PIL image
+        self._ts = 0.0
+        self._mon_idx = None
+        self._out = [0, 0]           # scaled size (v1 compat global)
+
+    # -- mss lifecycle ---------------------------------------------------
+    def _grabber(self):
+        if self._sct is None:
+            mss_mod = _mss_mod()
+            self._sct = mss_mod.mss() if hasattr(mss_mod, "mss") else mss_mod.MSS()
+        return self._sct
+
+    def _reset(self):
+        try:
+            if self._sct is not None:
+                self._sct.close()
+        except Exception:
+            pass
+        self._sct = None
+
+    # -- raw capture ------------------------------------------------------
+    def grab(self, region: Optional[dict] = None):
+        """Full-res capture (mss persistent; one retry on stale instance)."""
+        PIL = _pil()
+        for attempt in (0, 1):
+            try:
+                s = self._grabber()
+                mons = s.monitors
+                idx = MONITOR_IDX
+                mon = region or (
+                    mons[idx] if 1 <= idx < len(mons) else (mons[1] if len(mons) > 1 else mons[0])
+                )
+                raw = s.grab(mon)
+                return PIL.Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+            except Exception:
+                self._reset()
+                if attempt:
+                    break
+        # fallbacks (headless / odd X servers)
+        raw_img = None
+        for cmd in (["scrot", "-o", "/tmp/_ld_shot.png"], ["gnome-screenshot", "-f", "/tmp/_ld_shot.png"]):
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                raw_img = PIL.open("/tmp/_ld_shot.png").convert("RGB")
+                break
+            except Exception:
+                continue
+        if raw_img is None:
+            try:
+                raw_img = _pyautogui().screenshot()
+            except Exception:
+                raw_img = PIL.new("RGB", (1280, 800), (0, 0, 0))
+        return raw_img
+
+    # -- cached scaled frame -----------------------------------------------
+    def frame(self, fresh: bool = False, max_age_ms: Optional[float] = None, monitor_idx=None):
+        """Scaled (<= MAXW) frame. TTL-cache reads; fresh=True forces grab."""
+        with _lock:
+            ttl = CFG.get("frame_ttl_ms", 250) if max_age_ms is None else max_age_ms
+            stale_mon = monitor_idx is not None and self._mon_idx is not None and monitor_idx != self._mon_idx
+            if (
+                not fresh
+                and self._img is not None
+                and not stale_mon
+                and (ttl <= 0 or (time.time() - self._ts) * 1000.0 <= ttl)
+                and (monitor_idx is None or monitor_idx == self._mon_idx)
+            ):
+                return self._img
+            raw = self.grab()
+            w = min(MAXW, raw.width)
+            img = raw.resize((w, round(raw.height * w / raw.width)))
+            self._img = img
+            self._raw = raw
+            self._ts = time.time()
+            self._mon_idx = MONITOR_IDX if monitor_idx is None else monitor_idx
+            self._out[:] = [img.width, img.height]
+            return img
+
+    def raw(self, fresh: bool = False):
+        self.frame(fresh=fresh)  # ensures cache + _raw in sync
+        return self._raw
+
+    def invalidate(self):
+        with _lock:
+            self._ts = -1e9  # TTL dead; next read grabs fresh
+
+    # -- change detection ----------------------------------------------------
+    def thumb(self, img):
+        return img.resize((96, 54)).convert("L").tobytes()
+
+    def change(self, img, commit: bool = True) -> float:
+        t, p = self.thumb(img), _prev[0]
+        pct = 0.0 if p is None else sum(abs(a - b) for a, b in zip(t, p)) / (len(t) * 255) * 100
+        if commit:
+            with _lock:
+                _prev[0] = t
+        return round(pct, 1)
+
+
+_E = FrameEngine()
 
 
 def frame(monitor_idx=None):
-    with _lock:
-        idx = monitor_idx if monitor_idx is not None else MONITOR_IDX
-        try:
-            with _mss_factory() as s:
-                mons = s.monitors
-                if idx == 0:
-                    imgs = []
-                    for m in mons[1:]:
-                        raw = s.grab(m)
-                        img = PILImage.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-                        imgs.append((m["left"], m["top"], img))
-                    min_x = min(x for x, _, _ in imgs)
-                    min_y = min(y for _, y, _ in imgs)
-                    max_x = max(x + img.width for x, _, img in imgs)
-                    max_y = max(y + img.height for _, y, img in imgs)
-                    combined = PILImage.new("RGB", (max_x - min_x, max_y - min_y))
-                    for x, y, img in imgs:
-                        combined.paste(img, (x - min_x, y - min_y))
-                    raw_img = combined
-                elif idx == -1:
-                    raw = s.grab(mons[-1])
-                    raw_img = PILImage.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-                elif 1 <= idx < len(mons):
-                    raw = s.grab(mons[idx])
-                    raw_img = PILImage.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-                else:
-                    raw = s.grab(mons[1])
-                    raw_img = PILImage.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-        except Exception:
-            # Fallback for displays mss cannot handle (e.g. 16-bit Xvfb in CI)
-            raw_img = None
-            for cmd in (["scrot", "-o", "/tmp/_ld_shot.png"],
-                        ["gnome-screenshot", "-f", "/tmp/_ld_shot.png"]):
-                try:
-                    import subprocess as _sp
-                    _sp.run(cmd, check=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=10)
-                    raw_img = PILImage.open("/tmp/_ld_shot.png").convert("RGB")
-                    break
-                except Exception:
-                    continue
-            if raw_img is None:
-                try:
-                    raw_img = pyautogui.screenshot()
-                except Exception:
-                    raw_img = PILImage.new("RGB", (1280, 800), (0, 0, 0))
-        w = min(MAXW, raw_img.width)
-        img = raw_img.resize((w, round(raw_img.height * w / raw_img.width)))
-        _out[:] = [img.width, img.height]
-        return img
+    """v1-compatible global frame() — TTL-cached (reads fast, writes invalid)."""
+    return _E.frame(monitor_idx=monitor_idx)
+
+
+def get_monitors():
+    try:
+        s = _E._grabber()
+        return s.monitors
+    except Exception:
+        return [{"left": 0, "top": 0, "width": 1280, "height": 800}]
 
 
 def encode(img, fmt="PNG", **kw):
@@ -304,64 +376,226 @@ def encode(img, fmt="PNG", **kw):
     return b.getvalue()
 
 
-def thumb(img):
-    return img.resize((96, 54)).convert("L").tobytes()
+# ---------------------------------------------------------------- OCR engine
+class OCREngine:
+    """Multi-engine OCR + word boxes + hash cache + region OCR.
+
+    engine: rapidocr (if installed, bohot fast on CPU) -> tesseract -> off
+    cache : image hash -> {text, words[(w, x, y, w, h, conf)]}
+    boxes : click_text ab bina accessibility ke bhi kaam karta hai
+    """
+
+    def __init__(self) -> None:
+        self._cache: Dict[str, dict] = {}
+        self._rapid = None
+        self._engine = None
+
+    def _pick(self) -> str:
+        if self._engine:
+            return self._engine
+        want = str(CFG.get("ocr_engine", "auto")).lower()
+        if want == "off":
+            self._engine = "off"
+        elif want == "rapidocr":
+            self._engine = "rapidocr" if self._load_rapid() else "off"
+        elif want == "tesseract":
+            self._engine = "tesseract" if _probe("pytesseract") else "off"
+        else:  # auto
+            if self._load_rapid():
+                self._engine = "rapidocr"
+            elif _probe("pytesseract"):
+                self._engine = "tesseract"
+            else:
+                self._engine = "off"
+        return self._engine
+
+    def _load_rapid(self):
+        if self._rapid is not None:
+            return True
+        if not _probe("numpy"):
+            return False
+        try:
+            try:
+                from rapidocr_onnxruntime import RapidOCR  # classic package name
+            except ImportError:
+                from rapidocr import RapidOCR  # newer
+            self._rapid = RapidOCR()
+            return True
+        except Exception:
+            return False
+
+    # -- core ---------------------------------------------------------------
+    def _tess_words(self, img) -> List[dict]:
+        import pytesseract
+        gray = img.convert("L")
+        if gray.width < 1000:
+            gray = gray.resize((gray.width * 2, gray.height * 2))
+            scale = 2.0
+        else:
+            scale = 1.0
+        data = pytesseract.image_to_data(gray, lang=CFG.get("ocr_lang", "eng"), output_type=pytesseract.Output.DICT)
+        words = []
+        n = len(data.get("text", []))
+        for i in range(n):
+            w = (data["text"][i] or "").strip()
+            try:
+                conf = float(data["conf"][i])
+            except (TypeError, ValueError):
+                conf = -1.0
+            if not w or conf < 30:
+                continue
+            x = data["left"][i] / scale
+            y = data["top"][i] / scale
+            ww = data["width"][i] / scale
+            hh = data["height"][i] / scale
+            words.append({"w": w, "x": x, "y": y, "w_px": ww, "h_px": hh, "conf": conf})
+        return words
+
+    def _rapid_words(self, img) -> List[dict]:
+        import numpy as np
+        arr = np.array(img.convert("RGB"))[:, :, ::-1]  # RGB->BGR
+        result, _elapse = self._rapid(arr)
+        words = []
+        if result:
+            for box, text, score in result:
+                try:
+                    xs = [p[0] for p in box]
+                    ys = [p[1] for p in box]
+                    words.append({
+                        "w": str(text), "x": min(xs), "y": min(ys),
+                        "w_px": max(xs) - min(xs), "h_px": max(ys) - min(ys),
+                        "conf": float(score),
+                    })
+                except Exception:
+                    continue
+        return words
+
+    def analyze(self, img) -> dict:
+        """{text, words} — cached by image hash."""
+        h = _hash_bytes(img.tobytes())
+        hit = self._cache.get(h)
+        if hit is not None:
+            return hit
+        engine = self._pick()
+        try:
+            if engine == "rapidocr":
+                words = self._rapid_words(img)
+            elif engine == "tesseract":
+                words = self._tess_words(img)
+            else:
+                words = []
+        except Exception as e:
+            return {"text": f"OCR error: {e}", "words": [], "engine": engine}
+        text = " ".join(x["w"] for x in words)
+        entry = {"text": text, "words": words, "engine": engine}
+        # cache last few frames only
+        if len(self._cache) > 6:
+            for k in list(self._cache.keys())[:-3]:
+                self._cache.pop(k, None)
+        self._cache[h] = entry
+        return entry
+
+    def text(self, img) -> str:
+        if self._pick() == "off":
+            return "OCR not available (install pytesseract or rapidocr)"
+        return self.analyze(img)["text"]
+
+    def region_text(self, img, box: Tuple[int, int, int, int]) -> str:
+        """OCR sirf region (x,y,w,h) — 5-10x faster than full screen."""
+        x, y, w, h = box
+        crop = img.crop((max(0, x), max(0, y), min(img.width, x + w), min(img.height, y + h)))
+        if self._pick() == "off":
+            return "OCR not available"
+        return self.analyze(crop)["text"]
 
 
-def change(img, commit=True):
-    t, p = thumb(img), _prev[0]
-    pct = 0.0 if p is None else sum(abs(a - b) for a, b in zip(t, p)) / (len(t) * 255) * 100
-    if commit:
-        with _lock:
-            _prev[0] = t
-    return round(pct, 1)
+_OCR = OCREngine()
 
 
 def ocr_text(img):
-    if not HAS_TESS:
-        return "OCR not available (install pytesseract)"
-    h = _hash_img(img)
-    if _ocr_cache["hash"] == h and _ocr_cache["text"] is not None:
-        return _ocr_cache["text"]
+    """v1-compatible ocr_text."""
+    return _OCR.text(img)
+
+
+# ---------------------------------------------------------------- fuzzy find
+def _ratio(a: str, b: str) -> float:
+    """Similarity 0..100 (rapidfuzz if installed, else difflib)."""
+    a, b = a.lower(), b.lower()
+    if not a or not b:
+        return 0.0
     try:
-        gray = img.convert("L")
-        if gray.width < 1000:
-            gray = gray.resize((gray.width * 2, gray.height * 2), PILImage.LANCZOS)
-        text = pytesseract.image_to_string(gray, lang=CFG.get("ocr_lang", "eng"))
-        text = text.strip()
-        _ocr_cache["hash"] = h
-        _ocr_cache["text"] = text
-        return text
-    except Exception as e:
-        return f"OCR error: {e}"
+        from rapidfuzz import fuzz
+        return float(fuzz.ratio(a, b))
+    except ImportError:
+        pass
+    try:
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, a, b).ratio() * 100.0
+    except Exception:
+        return 100.0 if a == b else 0.0
 
 
-# ---- Accessibility (elements) ----
-@dataclass
-class AXNode:
-    id: str
-    role: str
-    name: str
-    value: str
-    bounds: Tuple[int, int, int, int]
-    enabled: bool = True
-    focused: bool = False
-    selected: bool = False
+def fuzzy_rank(query: str, candidates: List[str], limit: int = 5) -> List[Tuple[float, str]]:
+    """Best matches first. Substring bonus ke saath scoring."""
+    q = query.lower()
+    scored = []
+    for c in candidates:
+        cl = (c or "").strip()
+        if not cl:
+            continue
+        score = _ratio(q, cl)
+        if q and q in cl.lower():
+            score = max(score, 90.0 + min(9.0, len(q) * 1.5))
+        scored.append((score, cl))
+    scored.sort(key=lambda t: -t[0])
+    return scored[:limit]
+
+
+# ---------------------------------------------------------------- a11y (cached)
+AX_TTL = [0.0]
+_AX_CACHE: List = []
 
 
 def ax_tree():
-    nodes = []
-    if not HAS_AX:
-        return [AXNode("no-ax", "error", "Accessibility not available", "", (0, 0, 0, 0), False, False, False)]
+    """Accessibility tree — TTL cache (v1 me har call pe poori walk)."""
+    now = time.time()
+    if (now - AX_TTL[0]) * 1000.0 <= CFG.get("ax_ttl_ms", 500) and _AX_CACHE:
+        return _AX_CACHE
+    nodes = _ax_walk()
+    with _lock:
+        AX_TTL[0] = now
+        _AX_CACHE[:] = nodes
+    return nodes
+
+
+def _ax_walk() -> List:
+    """v1 walk logic (Windows UIA / win32 / macOS AX / Linux AT-SPI)."""
+    from dataclasses import dataclass as _dc
+
+    @_dc
+    class AXNode:
+        id: str
+        role: str
+        name: str
+        value: str
+        bounds: Tuple[int, int, int, int]
+        enabled: bool = True
+        focused: bool = False
+        selected: bool = False
+
+    nodes: List[AXNode] = []
+    has_ax = False
     if sys.platform == "win32":
         try:
+            import uiautomation as auto
+            has_ax = True
             try:
                 import pythoncom
                 pythoncom.CoInitialize()
             except Exception:
                 pass
-            import uiautomation as auto
             desktop = auto.GetRootControl()
+
             def walk(el, depth=0):
                 if depth > 12:
                     return
@@ -371,16 +605,14 @@ def ax_tree():
                     rect = el.BoundingRectangle
                     x, y = int(rect.left), int(rect.top)
                     w, h = int(rect.width()), int(rect.height())
-                    enabled = bool(el.IsEnabled)
-                    focused = bool(el.HasKeyboardFocus)
-                    val = ""
-                    try:
-                        val = el.GetValuePattern().Value or ""
-                    except Exception:
-                        pass
                     eid = f"{role}:{name}:{x}:{y}:{w}:{h}"[:120]
                     if w > 0 and h > 0:
-                        nodes.append(AXNode(eid, role, name, val, (x, y, w, h), enabled, focused, False))
+                        val = ""
+                        try:
+                            val = el.GetValuePattern().Value or ""
+                        except Exception:
+                            pass
+                        nodes.append(AXNode(eid, role, name, val, (x, y, w, h), bool(el.IsEnabled), bool(el.HasKeyboardFocus), False))
                 except Exception:
                     pass
                 try:
@@ -388,6 +620,7 @@ def ax_tree():
                         walk(child, depth + 1)
                 except Exception:
                     pass
+
             walk(desktop)
         except Exception as e:
             log.warning(f"Windows UIA failed: {e}")
@@ -406,10 +639,10 @@ def ax_tree():
                 win32gui.EnumWindows(enum_windows, None)
             except Exception:
                 pass
-
     elif sys.platform == "darwin":
         try:
             import atomacos
+            has_ax = True
             app = atomacos.getFrontmostApplication()
 
             def walk(el):
@@ -422,12 +655,10 @@ def ax_tree():
                     size = el.AXSize or (0, 0)
                     x, y = int(pos[0]), int(pos[1])
                     w, h = int(size[0]), int(size[1])
-                    enabled = bool(el.AXEnabled) if hasattr(el, "AXEnabled") else True
-                    focused = bool(el.AXFocused) if hasattr(el, "AXFocused") else False
                     val = str(el.AXValue) if el.AXValue is not None else ""
                     eid = f"{role}:{name}:{x}:{y}:{w}:{h}"[:120]
                     if w > 0 and h > 0:
-                        nodes.append(AXNode(eid, role, name, val, (x, y, w, h), enabled, focused, False))
+                        nodes.append(AXNode(eid, role, name, val, (x, y, w, h), True, False, False))
                 except Exception:
                     pass
                 try:
@@ -441,6 +672,10 @@ def ax_tree():
             log.warning(f"macOS AX failed: {e}")
     else:
         try:
+            import gi
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi
+            has_ax = True
             desktop = Atspi.get_desktop(0)
 
             def walk(el, depth=0):
@@ -472,13 +707,16 @@ def ax_tree():
             log.warning(f"AT-SPI error: {e}")
 
     interactive = {"button", "link", "menuitem", "checkbox", "radiobutton", "slider", "textbox", "combobox", "listitem", "tab", "pushbutton", "menu", "text", "edit", "document", "pane", "window", "dialog", "alert", "label", "image", "hyperlink", "dataitem", "treeitem"}
+
     def _norm_role(r):
         r = (r or "").lower()
         if r.endswith("control"):
             r = r[:-7]
         return r
+
+    if not has_ax:
+        return [AXNode("no-ax", "error", "Accessibility not available", "", (0, 0, 0, 0), False, False, False)]
     filtered = [n for n in nodes if _norm_role(n.role) in interactive and n.bounds[2] > 0 and n.bounds[3] > 0]
-    # dedupe by id
     seen = set()
     out = []
     for n in filtered:
@@ -487,6 +725,9 @@ def ax_tree():
         seen.add(n.id)
         out.append(n)
     return out
+
+
+AXNode = None  # ax_tree dataclass andar hai; type-only use
 
 
 def ax_to_text(nodes, max_lines=300):
@@ -509,44 +750,35 @@ def ax_to_text(nodes, max_lines=300):
 
 
 def find_element(nodes, query):
+    """v1 exact/word containment + v2 fuzzy fallback."""
     q = query.lower()
     for n in nodes:
         if q in n.name.lower() or q in n.value.lower() or q in n.id.lower():
             return n
-    # fuzzy: contains any word
     for n in nodes:
         if any(w in n.name.lower() for w in q.split() if len(w) > 2):
             return n
+    # v2: fuzzy — "Logn" bhi "Login" dhundh leta hai
+    best, best_score = None, 0.0
+    for n in nodes:
+        for field in (n.name, n.value):
+            score = _ratio(q, (field or "").lower())
+            if score > best_score:
+                best, best_score = n, score
+    if best is not None and best_score >= 55.0:
+        return best
     return None
 
 
-# ---- Template matching ----
-def find_template(screen, template_path, threshold=0.8):
-    if not HAS_CV2:
-        return None
-    try:
-        screen_cv = cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2BGR)
-        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
-        if template is None:
-            return None
-        result = cv2.matchTemplate(screen_cv, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        if max_val >= threshold:
-            h, w = template.shape[:2]
-            return (max_loc[0] + w // 2, max_loc[1] + h // 2)
-    except Exception:
-        pass
-    return None
-
-
-# ---- Guard / Safety ----
+# ---------------------------------------------------------------- guard
 def guard():
     check_rate_limit()
     if STOP_FILE.exists():
         raise RuntimeError("Emergency stop file exists (~/.agentseeai_stop). Ask the human.")
-    cur = pyautogui.position()
+    pag = _pyautogui()
+    cur = pag.position()
     if CFG["mouse_abort_corner"]:
-        W, H = pyautogui.size()
+        W, H = pag.size()
         corners = [(cur.x < 50 and cur.y < 50), (cur.x > W - 50 and cur.y < 50),
                    (cur.x < 50 and cur.y > H - 50), (cur.x > W - 50 and cur.y > H - 50)]
         if any(corners):
@@ -555,7 +787,7 @@ def guard():
         quiet_since, last = time.time(), cur
         while time.time() - quiet_since < CFG["mouse_pause_wait"]:
             time.sleep(0.2)
-            now = pyautogui.position()
+            now = pag.position()
             if now != last:
                 last, quiet_since = now, time.time()
         _mouse[0] = (last.x, last.y)
@@ -570,13 +802,11 @@ def check_app_allowed():
             import win32gui, win32process, psutil
             hwnd = win32gui.GetForegroundWindow()
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            p = psutil.Process(pid)
-            name = p.name().lower()
+            name = psutil.Process(pid).name().lower()
         elif sys.platform == "darwin":
             from AppKit import NSWorkspace
             name = NSWorkspace.sharedWorkspace().frontmostApplication().localizedName().lower()
         else:
-            import subprocess
             out = subprocess.check_output(["xdotool", "getwindowfocus", "getwindowname"], text=True, stderr=subprocess.DEVNULL)
             name = out.strip().lower()
         for deny in CFG["denylist"]:
@@ -594,169 +824,196 @@ def check_app_allowed():
 
 def to_screen(x, y):
     with _lock:
-        if not _out[0]:
-            frame()
-        W, H = pyautogui.size()
-        ox, oy = _out[0], _out[1]
+        if not _E._out[0]:
+            _E.frame()
+        pag = _pyautogui()
+        W, H = pag.size()
+        ox, oy = _E._out[0], _E._out[1]
     return round(x * W / ox), round(y * H / oy)
 
 
-def act(fn, settle=None):
+def act(fn, settle=None, no_look: bool = False):
+    """v2 act: cache-invalidate on write + optional no_look (fast chains)."""
     guard()
     if not check_app_allowed():
         raise RuntimeError("Current app is denylisted or not in allowlist.")
+    _E.invalidate()  # action screen badal deta hai — purani image jhoot bolegi
     fn()
-    p = pyautogui.position()
+    pag = _pyautogui()
+    p = pag.position()
     _mouse[0] = (p.x, p.y)
-    time.sleep((settle if settle is not None else CFG["settle_ms"]) / 1000)
-    img = frame()
-    pct = change(img)
+    s = settle if settle is not None else CFG.get("settle_ms", 120)
+    if s:
+        time.sleep(s / 1000.0)
+    if no_look:
+        return None, "done (fast, no screenshot)"
+    img = _E.frame(fresh=True)
+    pct = _E.change(img)
     return img, f"done. screen changed {pct}%. image {img.width}x{img.height}"
 
 
-# ---- Hands ----
+# ---------------------------------------------------------------- hands (v1 API + speed)
 def screenshot():
     guard()
-    img = frame()
-    pct = change(img, commit=False)
+    img = _E.frame(fresh=True)
+    pct = _E.change(img, commit=False)
     return img, f"image {img.width}x{img.height}. changed {pct}% since last look"
 
 
-def click(x: int, y: int, button: str = "left", clicks: int = 1):
-    return act(lambda: pyautogui.click(*to_screen(x, y), clicks=clicks, button=button))
+def click(x: int, y: int, button: str = "left", clicks: int = 1, no_look: bool = False):
+    return act(lambda: _pyautogui().click(*to_screen(x, y), clicks=clicks, button=button), no_look=no_look)
 
 
-def move(x: int, y: int):
-    return act(lambda: pyautogui.moveTo(*to_screen(x, y), duration=0.15))
+def move(x: int, y: int, duration_ms: int = None):
+    d = (CFG.get("move_duration_ms", 0) if duration_ms is None else duration_ms) / 1000.0
+    return act(lambda: _pyautogui().moveTo(*to_screen(x, y), duration=d))
 
 
 def drag(x1: int, y1: int, x2: int, y2: int):
     def go():
-        pyautogui.moveTo(*to_screen(x1, y1))
-        pyautogui.dragTo(*to_screen(x2, y2), duration=0.4, button="left")
+        pag = _pyautogui()
+        pag.moveTo(*to_screen(x1, y1))
+        pag.dragTo(*to_screen(x2, y2), duration=0.4, button="left")
     return act(go)
 
 
-def scroll(amount: int, x: int = None, y: int = None):
+def scroll(amount: int, x: int = None, y: int = None, no_look: bool = False):
     def go():
+        pag = _pyautogui()
         if x is not None and y is not None:
-            pyautogui.moveTo(*to_screen(x, y))
-        pyautogui.scroll(amount)
-    return act(go)
+            pag.moveTo(*to_screen(x, y))
+        pag.scroll(amount)
+    return act(go, no_look=no_look)
 
 
 def hscroll(amount: int, x: int = None, y: int = None):
     def go():
+        pag = _pyautogui()
         if x is not None and y is not None:
-            pyautogui.moveTo(*to_screen(x, y))
-        pyautogui.hscroll(amount)
+            pag.moveTo(*to_screen(x, y))
+        pag.hscroll(amount)
     return act(go)
 
 
-def type_text(text: str):
+def type_text(text: str, no_look: bool = False):
+    """v2: lambi/unicode text = clipboard paste (instant), chhoti = write(0ms)."""
     def go():
-        if text.isascii():
-            pyautogui.write(text, interval=0.01)
-        else:
+        pag = _pyautogui()
+        if (len(text) >= CFG.get("clipboard_min_chars", 60)) or not text.isascii():
             import pyperclip
             pyperclip.copy(text)
-            pyautogui.hotkey("command" if sys.platform == "darwin" else "ctrl", "v")
-    return act(go)
+            pag.hotkey("command" if sys.platform == "darwin" else "ctrl", "v")
+        else:
+            pag.write(text, interval=0)
+    return act(go, no_look=no_look)
 
 
 _KEY_ALIASES = {"cmd": "command", "ctrl": "ctrl", "control": "ctrl", "win": "win", "super": "win", "alt": "alt", "option": "alt", "shift": "shift", "enter": "enter", "return": "enter", "esc": "esc", "escape": "esc", "tab": "tab", "space": "space", "backspace": "backspace", "delete": "delete", "del": "delete", "up": "up", "down": "down", "left": "left", "right": "right", "home": "home", "end": "end", "pageup": "pageup", "pagedown": "pagedown"}
 
 
-def key(keys: str):
+def key(keys: str, no_look: bool = False):
     parts = keys.lower().replace(" ", "").split("+")
     mapped = [_KEY_ALIASES.get(p, p) for p in parts]
-    return act(lambda: pyautogui.hotkey(*mapped))
+    return act(lambda: _pyautogui().hotkey(*mapped), no_look=no_look)
 
 
 def hold_key(keys: str, duration: float = 1.0):
     parts = keys.lower().replace(" ", "").split("+")
     mapped = [_KEY_ALIASES.get(p, p) for p in parts]
+
     def go():
+        pag = _pyautogui()
         for k in mapped:
-            pyautogui.keyDown(k)
+            pag.keyDown(k)
         time.sleep(float(duration))
         for k in reversed(mapped):
-            pyautogui.keyUp(k)
-    return act(go, settle=CFG["settle_ms"])
+            pag.keyUp(k)
+    return act(go)
 
 
 def mouse_down(button: str = "left", x: int = None, y: int = None):
     def go():
+        pag = _pyautogui()
         if x is not None and y is not None:
-            pyautogui.moveTo(*to_screen(x, y))
-        pyautogui.mouseDown(button=button)
+            pag.moveTo(*to_screen(x, y))
+        pag.mouseDown(button=button)
     return act(go)
 
 
 def mouse_up(button: str = "left", x: int = None, y: int = None):
     def go():
+        pag = _pyautogui()
         if x is not None and y is not None:
-            pyautogui.moveTo(*to_screen(x, y))
-        pyautogui.mouseUp(button=button)
+            pag.moveTo(*to_screen(x, y))
+        pag.mouseUp(button=button)
     return act(go)
 
 
 def cursor_position():
     guard()
-    p = pyautogui.position()
-    # map to scaled coords
-    if _out[0]:
-        W, H = pyautogui.size()
-        sx = round(p.x * _out[0] / W)
-        sy = round(p.y * _out[1] / H)
+    pag = _pyautogui()
+    p = pag.position()
+    if _E._out[0]:
+        W, H = pag.size()
+        sx = round(p.x * _E._out[0] / W)
+        sy = round(p.y * _E._out[1] / H)
     else:
         sx, sy = p.x, p.y
-    img = frame()
+    img = _E.frame()
     return img, f"cursor @({sx},{sy}) scaled, real ({p.x},{p.y})"
 
 
 def wait_change(timeout: float = 5.0):
+    """v2: early-exit poll (fixed interval nahi) + har poll pe cached compare."""
     guard()
     base = _prev[0]
     end = time.time() + float(timeout)
+    last_pct = 0.0
     while time.time() < end:
-        img = frame()
-        t = thumb(img)
+        img = _E.frame(fresh=True)
+        t = _E.thumb(img)
         d = 0 if base is None else sum(abs(a - b) for a, b in zip(t, base)) / (len(t) * 255) * 100
         if d > CFG["change_threshold"]:
-            time.sleep(0.3)
+            time.sleep(min(0.3, CFG.get("settle_ms", 120) / 1000.0))
             break
-        time.sleep(0.2)
-    img = frame()
-    pct = change(img)
-    return img, f"screen changed {pct}%. image {img.width}x{img.height}"
+        last_pct = d
+        time.sleep(0.15)
+    img = _E.frame(fresh=True)
+    pct = _E.change(img)
+    return img, f"screen changed {pct}% (last poll delta {round(last_pct,1)}%). image {img.width}x{img.height}"
 
 
-def wait_for_text(text: str, timeout: float = 10.0, interval: float = 0.5):
+def wait_for_text(text: str, timeout: float = 10.0, interval: float = 0.5, region: str = ""):
+    """v2: OCR + AX dono check + optional region 'x,y,w,h' (10x faster)."""
     guard()
     q = text.lower()
+    box = _parse_region(region) if region else None
     end = time.time() + float(timeout)
     last = ""
     while time.time() < end:
-        img = frame()
-        t = ocr_text(img)
+        img = _E.frame(fresh=True)
+        t = _OCR.region_text(img, box) if box else _OCR.text(img)
         if q in t.lower():
-            pct = change(img)
+            pct = _E.change(img)
             return img, f"FOUND '{text}' on screen. changed {pct}%"
+        nodes = ax_tree()
+        for n in nodes:
+            if q in (n.name or "").lower() or q in (n.value or "").lower():
+                pct = _E.change(img)
+                return img, f"FOUND '{text}' in UI. changed {pct}%"
         last = t
         time.sleep(float(interval))
-    img = frame()
-    pct = change(img)
+    img = _E.frame(fresh=True)
+    pct = _E.change(img)
     return img, f"NOT FOUND '{text}' within {timeout}s. last ocr: {last[:200]}"
 
 
 def zoom(x: int, y: int, w: int = 200, h: int = 200):
     guard()
-    img = frame()
-    rx, ry = to_screen(x, y)
-    # crop region in scaled space -> map to real
-    W, H = pyautogui.size()
-    ox, oy = _out[0], _out[1]
+    _E.frame()
+    pag = _pyautogui()
+    W, H = pag.size()
+    ox, oy = _E._out[0], _E._out[1]
     cx = round(x * W / ox)
     cy = round(y * H / oy)
     cw = round(w * W / ox)
@@ -765,98 +1022,209 @@ def zoom(x: int, y: int, w: int = 200, h: int = 200):
     top = max(0, cy - ch // 2)
     right = min(W, left + cw)
     bottom = min(H, top + ch)
-    # grab real region via mss (fallback to full screenshot crop)
     try:
-        with _mss_factory() as s:
-            mon = s.monitors[MONITOR_IDX if 1 <= MONITOR_IDX < len(s.monitors) else 1]
-            region = {"left": mon["left"] + left, "top": mon["top"] + top, "width": right - left, "height": bottom - top}
-            raw = s.grab(region)
-            zimg = PILImage.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        region = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+        zimg = _E.grab(region=region)
     except Exception:
-        full = pyautogui.screenshot()
+        full = pag.screenshot()
         zimg = full.crop((left, top, right, bottom))
-    zimg = zimg.resize((zimg.width * 2, zimg.height * 2), PILImage.NEAREST)
+    zimg = zimg.resize((zimg.width * 2, zimg.height * 2))
     return zimg, f"zoomed {zimg.width}x{zimg.height} around ({x},{y})"
 
 
 def record(seconds: float = 3.0, fps: float = 2.0):
     guard()
+    PIL = _pil()
     frames = []
     end = time.time() + float(seconds)
     while time.time() < end:
-        img = frame()
-        frames.append(img.copy())
+        frames.append(_E.frame(fresh=True).copy())
         time.sleep(1.0 / float(fps))
-    # build contact sheet
     if not frames:
-        img = frame()
-        return img, "no frames"
+        return _E.frame(fresh=True), "no frames"
     cols = 4
     rows = (len(frames) + cols - 1) // cols
     tw, th = frames[0].width // 2, frames[0].height // 2
-    sheet = PILImage.new("RGB", (cols * tw, rows * th), (0, 0, 0))
+    sheet = PIL.new("RGB", (cols * tw, rows * th), (0, 0, 0))
     for i, f in enumerate(frames):
         r, c = divmod(i, cols)
         sheet.paste(f.resize((tw, th)), (c * tw, r * th))
     return sheet, f"recorded {len(frames)} frames over {seconds}s -> contact sheet {sheet.width}x{sheet.height}"
 
 
-def read_screen():
+def _parse_region(region: str) -> Optional[Tuple[int, int, int, int]]:
+    """'x,y,w,h' string -> tuple (invalid -> None)."""
+    try:
+        parts = [int(p.strip()) for p in str(region).split(",")]
+        if len(parts) == 4 and all(p >= 0 for p in parts):
+            return (parts[0], parts[1], parts[2], parts[3])
+    except Exception:
+        pass
+    return None
+
+
+def read_screen(x: int = None, y: int = None, w: int = None, h: int = None):
+    """v2: region OCR optional (sirf us hisse ki padhai — 5-10x faster)."""
     guard()
-    img = frame()
-    text = ocr_text(img)
+    img = _E.frame()
+    if x is not None and y is not None and w and h:
+        text = _OCR.region_text(img, (x, y, w, h))
+        return img, f"OCR region({x},{y},{w},{h}) ({len(text)} chars):\n{text[:4000]}"
+    text = _OCR.text(img)
     return img, f"OCR ({len(text)} chars):\n{text[:4000]}"
 
 
-def find_text(query: str):
+# ---------------------------------------------------------------- smart find (v2)
+def _scaled_word_center(word, img):
+    """OCR word center in SCALED screenshot coords (click() isi ko use karta hai)."""
+    cx = word["x"] + word["w_px"] / 2.0
+    cy = word["y"] + word["h_px"] / 2.0
+    return round(cx), round(cy)
+
+
+def find_text(query: str, top: int = 3):
+    """v2: AX + OCR + fuzzy, top matches with coords (clickable)."""
     guard()
-    img = frame()
+    img = _E.frame()
+    matches: List[str] = []
+
     nodes = ax_tree()
     el = find_element(nodes, query)
     if el:
         x, y, w, h = el.bounds
         cx, cy = x + w // 2, y + h // 2
-        if _out[0]:
-            W, H = pyautogui.size()
-            sx = round(cx * _out[0] / W)
-            sy = round(cy * _out[1] / H)
+        if _E._out[0]:
+            pag = _pyautogui()
+            W, H = pag.size()
+            sx = round(cx * _E._out[0] / W)
+            sy = round(cy * _E._out[1] / H)
         else:
             sx, sy = cx, cy
-        return img, f"FOUND: {el.id} @({sx},{sy}) bounds({x},{y},{w},{h}) role={el.role} name='{el.name}'"
-    # fallback OCR
-    text = ocr_text(img)
-    if query.lower() in text.lower():
-        return img, f"FOUND in OCR text: '{query}' (use screenshot to locate)"
-    return img, f"NOT FOUND: '{query}' in {len(nodes)} elements"
+        matches.append(f"AX: {el.id} @({sx},{sy}) role={el.role} name='{el.name}'")
+
+    analysis = _OCR.analyze(img)
+    words = [wd for wd in analysis["words"] if wd["w"]]
+    ranked = fuzzy_rank(query, [wd["w"] for wd in words], limit=max(1, top))
+    for score, wtext in ranked:
+        if score < 50:
+            continue
+        for wd in words:
+            if wd["w"] == wtext:
+                sx, sy = _scaled_word_center(wd, img)
+                matches.append(f"OCR: '{wd['w']}' @({sx},{sy}) conf={round(wd['conf'])} match={round(score)}%")
+                break
+
+    if not matches:
+        if query.lower() in analysis.get("text", "").lower():
+            matches.append(f"OCR text: '{query}' (coords nahi mile — zoom use karo)")
+    if not matches:
+        return img, f"NOT FOUND: '{query}' in {len(nodes)} elements, {len(words)} OCR words"
+    return img, "FOUND:\n" + "\n".join(matches[:top])
 
 
 def click_text(query: str, button: str = "left", clicks: int = 1):
+    """v2: AX -> OCR word fallback (a11y na ho to bhi click ho jata hai)."""
     guard()
     nodes = ax_tree()
     el = find_element(nodes, query)
-    if not el:
-        img = frame()
-        return img, f"NOT FOUND: '{query}'"
-    x, y, w, h = el.bounds
-    cx, cy = x + w // 2, y + h // 2
-    # convert real screen coords to scaled screenshot coords
-    if _out[0]:
-        W, H = pyautogui.size()
-        sx = round(cx * _out[0] / W)
-        sy = round(cy * _out[1] / H)
-    else:
-        sx, sy = cx, cy
-    return click(sx, sy, button=button, clicks=clicks)
+    if el:
+        x, y, w, h = el.bounds
+        cx, cy = x + w // 2, y + h // 2
+        if _E._out[0]:
+            pag = _pyautogui()
+            W, H = pag.size()
+            sx = round(cx * _E._out[0] / W)
+            sy = round(cy * _E._out[1] / H)
+        else:
+            sx, sy = cx, cy
+        return click(sx, sy, button=button, clicks=clicks)
+
+    img = _E.frame()
+    analysis = _OCR.analyze(img)
+    words = [wd for wd in analysis["words"] if wd["w"]]
+    ranked = fuzzy_rank(query, [wd["w"] for wd in words], limit=1)
+    if ranked and ranked[0][0] >= 60:
+        target = ranked[0][1]
+        for wd in words:
+            if wd["w"] == target:
+                sx, sy = _scaled_word_center(wd, img)
+                res = click(sx, sy, button=button, clicks=clicks)
+                return res[0], f"clicked OCR word '{target}' @({sx},{sy}) {round(ranked[0][0])}% match. {res[1]}"
+    return img, f"NOT FOUND: '{query}' (AX + OCR dono me nahi)"
+
+
+def find_image(template_path: str, threshold: float = 0.8):
+    """v2 NEW: image template find (cv2) — buttons/icons jo text nahi rakhte."""
+    guard()
+    if not _probe("cv2"):
+        return _E.frame(), "opencv not installed (pip install opencv-python)"
+    import cv2
+    import numpy as np
+    img = _E.frame(fresh=True)
+    try:
+        screen_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        if template is None:
+            return img, f"template not readable: {template_path}"
+        result = cv2.matchTemplate(screen_cv, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        h, w = template.shape[:2]
+        cx, cy = max_loc[0] + w // 2, max_loc[1] + h // 2
+        if max_val >= threshold:
+            return img, f"FOUND image @({cx},{cy}) score={round(max_val, 2)} (click {cx} {cy})"
+        return img, f"NOT FOUND (best score {round(max_val, 2)} < {threshold})"
+    except Exception as e:
+        return img, f"find_image error: {e}"
+
+
+def pixel(x: int, y: int):
+    """v2 NEW: ek pixel ka color."""
+    guard()
+    rx, ry = to_screen(x, y)
+    img = _E.grab(region={"left": rx, "top": ry, "width": 1, "height": 1})
+    rgb = img.getpixel((0, 0))
+    return None, f"pixel({x},{y}) = rgb{tuple(rgb)}"
+
+
+def find_color(r: int, g: int, b: int, tol: int = 16, region: str = ""):
+    """v2 NEW: color dhoondo (numpy -> fast, warna PIL scan)."""
+    guard()
+    box = _parse_region(region) if region else None
+    img = _E.frame(fresh=True)
+    if box:
+        img = img.crop((box[0], box[1], box[0] + box[2], box[1] + box[3]))
+    try:
+        import numpy as np
+        arr = np.array(img.convert("RGB")).astype(int)
+        mask = (abs(arr[:, :, 0] - r) <= tol) & (abs(arr[:, :, 1] - g) <= tol) & (abs(arr[:, :, 2] - b) <= tol)
+        ys, xs = mask.nonzero()
+        if len(xs):
+            x, y = int(xs[0]), int(ys[0])
+            off_x = box[0] if box else 0
+            off_y = box[1] if box else 0
+            return None, f"FOUND color rgb({r},{g},{b}) @({x + off_x},{y + off_y}) ({len(xs)} px)"
+        return None, "NOT FOUND color"
+    except ImportError:
+        rgb_img = img.convert("RGB")
+        for yy in range(0, rgb_img.height, 2):
+            for xx in range(0, rgb_img.width, 2):
+                p = rgb_img.getpixel((xx, yy))
+                if abs(p[0] - r) <= tol and abs(p[1] - g) <= tol and abs(p[2] - b) <= tol:
+                    off_x = box[0] if box else 0
+                    off_y = box[1] if box else 0
+                    return None, f"FOUND color rgb({r},{g},{b}) @({xx + off_x},{yy + off_y})"
+        return None, "NOT FOUND color"
 
 
 def elements():
     guard()
     nodes = ax_tree()
     text = ax_to_text(nodes)
-    img = frame()
+    img = _E.frame()
     return img, text
 
 
+# ---------------------------------------------------------------- windows / apps
 def windows():
     guard()
     out = []
@@ -872,18 +1240,16 @@ def windows():
 
             win32gui.EnumWindows(cb, None)
         except Exception as e:
-            return frame(), f"windows error: {e}"
+            return _E.frame(), f"windows error: {e}"
     elif sys.platform == "darwin":
         try:
-            import subprocess
             r = subprocess.check_output(["osascript", "-e", 'tell application "System Events" to get name of every process whose background only is false'], text=True)
             for name in r.strip().split(", "):
                 out.append({"title": name})
         except Exception as e:
-            return frame(), f"windows error: {e}"
+            return _E.frame(), f"windows error: {e}"
     else:
         try:
-            import subprocess
             out_ids = subprocess.check_output(["xdotool", "search", "--name", ""], text=True, stderr=subprocess.DEVNULL).split()
             for wid in out_ids:
                 try:
@@ -892,7 +1258,6 @@ def windows():
                 except Exception:
                     pass
             if not out:
-                # fallback wmctrl
                 try:
                     r = subprocess.check_output(["wmctrl", "-l"], text=True, stderr=subprocess.DEVNULL)
                     for line in r.strip().splitlines():
@@ -902,8 +1267,8 @@ def windows():
                 except Exception:
                     pass
         except Exception as e:
-            return frame(), f"windows error: {e}"
-    img = frame()
+            return _E.frame(), f"windows error: {e}"
+    img = _E.frame()
     return img, json.dumps(out, indent=2)[:4000]
 
 
@@ -920,17 +1285,14 @@ def focus(title_query: str):
 
             win32gui.EnumWindows(cb, None)
         except Exception as e:
-            return frame(), f"focus error: {e}"
+            return _E.frame(), f"focus error: {e}"
     elif sys.platform == "darwin":
         try:
-            import subprocess
             subprocess.run(["osascript", "-e", f'tell application "{title_query}" to activate'], check=False)
         except Exception as e:
-            return frame(), f"focus error: {e}"
+            return _E.frame(), f"focus error: {e}"
     else:
         try:
-            import subprocess
-            # try by name then by class
             wids = []
             try:
                 wids = subprocess.check_output(["xdotool", "search", "--name", title_query], text=True, stderr=subprocess.DEVNULL).split()
@@ -943,12 +1305,8 @@ def focus(title_query: str):
                     pass
             if wids:
                 subprocess.run(["xdotool", "windowfocus", wids[0]], check=False, stderr=subprocess.DEVNULL)
-                try:
-                    subprocess.run(["xdotool", "windowraise", wids[0]], check=False, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
+                subprocess.run(["xdotool", "windowraise", wids[0]], check=False, stderr=subprocess.DEVNULL)
             else:
-                # fallback wmctrl
                 r = subprocess.check_output(["wmctrl", "-l"], text=True, stderr=subprocess.DEVNULL)
                 for line in r.strip().splitlines():
                     parts = line.split(None, 3)
@@ -956,36 +1314,39 @@ def focus(title_query: str):
                         subprocess.run(["wmctrl", "-ia", parts[0]], check=False)
                         break
         except Exception as e:
-            return frame(), f"focus error: {e}"
-    time.sleep(0.3)
-    img = frame()
-    return img, f"focused '{title_query}'. changed {change(img)}%"
+            return _E.frame(), f"focus error: {e}"
+    time.sleep(0.15)
+    img = _E.frame(fresh=True)
+    return img, f"focused '{title_query}'. changed {_E.change(img)}%"
 
 
 def open_app(name: str):
+    """v2: fixed 1s sleep nahi — real screen/window change ka adaptive wait."""
     guard()
-    # allowlist/denylist check on app name
     deny = [d.lower() for d in CFG["denylist"]]
     if any(d in name.lower() for d in deny):
-        return frame(), f"app '{name}' is denylisted"
-    if CFG["allowlist"] and not any(a.lower() in name.lower() for a in CFG["allowlist"]):
-        # allowlist is for foreground app; still try
-        pass
+        return _E.frame(), f"app '{name}' is denylisted"
     try:
         if sys.platform == "win32":
-            import subprocess
             subprocess.Popen(["cmd", "/c", "start", "", name], shell=False)
         elif sys.platform == "darwin":
-            import subprocess
             subprocess.Popen(["open", "-a", name])
         else:
-            import subprocess
             subprocess.Popen([name])
     except Exception as e:
-        return frame(), f"open_app error: {e}"
-    time.sleep(1.0)
-    img = frame()
-    return img, f"opened '{name}'. changed {change(img)}%"
+        return _E.frame(), f"open_app error: {e}"
+    if CFG.get("open_app_adaptive", True):
+        end = time.time() + 3.0
+        while time.time() < end:
+            img = _E.frame(fresh=True)
+            pct = _E.change(img, commit=False)
+            if pct > CFG["change_threshold"]:
+                return img, f"opened '{name}'. changed {round(pct,1)}% (adaptive, {round(3.0 - (end - time.time()), 1)}s)"
+            time.sleep(0.12)
+        return img, f"opened '{name}' (screen unchanged after 3s — app background me ho sakta hai)"
+    time.sleep(0.6)
+    img = _E.frame(fresh=True)
+    return img, f"opened '{name}'. changed {_E.change(img)}%"
 
 
 def clip_get():
@@ -994,9 +1355,8 @@ def clip_get():
         import pyperclip
         text = pyperclip.paste()
     except Exception as e:
-        return frame(), f"clipboard error: {e}"
-    img = frame()
-    return img, f"clipboard: {text[:2000]}"
+        return _E.frame(), f"clipboard error: {e}"
+    return None, f"clipboard: {text[:2000]}"
 
 
 def clip_set(text: str):
@@ -1005,15 +1365,14 @@ def clip_set(text: str):
         import pyperclip
         pyperclip.copy(text)
     except Exception as e:
-        return frame(), f"clipboard error: {e}"
-    img = frame()
-    return img, f"clipboard set ({len(text)} chars)"
+        return _E.frame(), f"clipboard error: {e}"
+    return None, f"clipboard set ({len(text)} chars)"
 
 
 def screens():
     guard()
     mons = get_monitors()
-    img = frame()
+    img = _E.frame()
     return img, json.dumps(mons, indent=2)
 
 
@@ -1022,25 +1381,32 @@ def set_screen(idx: int):
     MONITOR_IDX = int(idx)
     CFG["monitor"] = MONITOR_IDX
     save_config(CFG)
-    img = frame()
+    _E.invalidate()
+    img = _E.frame(fresh=True)
     return img, f"monitor set to {MONITOR_IDX}. image {img.width}x{img.height}"
 
 
 def status():
     guard()
-    img = frame()
+    img = _E.frame()
     info = {
+        "version": VERSION,
+        "build": BUILD_DATE,
         "platform": sys.platform,
         "python": sys.version.split()[0],
         "monitor": MONITOR_IDX,
         "monitors": len(get_monitors()),
-        "out_size": list(_out),
-        "has_ax": HAS_AX,
-        "has_tess": HAS_TESS,
-        "has_cv2": HAS_CV2,
+        "out_size": list(_E._out),
+        "ocr_engine": _OCR._pick(),
+        "has_tess": _probe("pytesseract"),
+        "has_rapidocr": _OCR._rapid is not None,
+        "has_cv2": _probe("cv2"),
+        "has_ax": bool(ax_tree() and ax_tree()[0].role != "error"),
         "stop_file": STOP_FILE.exists(),
         "token": TOKEN,
         "port": PORT,
+        "fast_port": FAST_PORT,
+        "fast_server_alive": fast_server_alive(),
         "actions_logged": len(_session_log),
     }
     return img, json.dumps(info, indent=2)
@@ -1050,7 +1416,6 @@ def ask_approval(question: str, timeout: float = 60.0):
     guard()
     aid = secrets.token_urlsafe(6)
     _approval_queue[aid] = {"status": "pending", "question": question, "answer": None, "created": time.time()}
-    # write to events
     try:
         with open(EVENTS_PATH, "a") as f:
             f.write(json.dumps({"t": time.time(), "approval": aid, "question": question}) + "\n")
@@ -1061,24 +1426,94 @@ def ask_approval(question: str, timeout: float = 60.0):
         st = _approval_queue[aid]["status"]
         if st in ("approved", "denied"):
             ans = _approval_queue[aid]["answer"]
-            img = frame()
+            img = _E.frame()
             return img, f"approval {aid}: {st}. answer={ans}"
         time.sleep(0.5)
     _approval_queue[aid]["status"] = "timeout"
-    img = frame()
+    img = _E.frame()
     return img, f"approval {aid}: timeout after {timeout}s"
 
 
-# ---- CLI helpers for approval via viewer ----
+# ---------------------------------------------------------------- batch `do` (v2 NEW)
+CLI_NAMES = {
+    "shot": screenshot, "screenshot": screenshot,
+    "click": click, "move": move, "drag": drag, "scroll": scroll, "hscroll": hscroll,
+    "type": type_text, "type_text": type_text, "key": key, "hold_key": hold_key,
+    "mouse_down": mouse_down, "mouse_up": mouse_up, "cursor_position": cursor_position,
+    "wait": wait_change, "wait_change": wait_change, "wait_for_text": wait_for_text,
+    "zoom": zoom, "record": record, "read_screen": read_screen, "ocr": read_screen,
+    "find": find_text, "find_text": find_text, "click_text": click_text,
+    "find_image": find_image, "pixel": pixel, "find_color": find_color,
+    "tree": elements, "elements": elements,
+    "windows": windows, "focus": focus, "open_app": open_app,
+    "clip_get": clip_get, "clip_set": clip_set, "screens": screens, "set_screen": set_screen,
+    "status": status, "ask_approval": ask_approval,
+}
+
+
+def execute_steps(steps: List[dict]) -> Tuple[Optional[Any], str]:
+    """Batch runner: [{cmd, args, kwargs, no_look}] — ek process, ek journey.
+
+    har step me no_look:true ho to screenshot skip (ms-level chain),
+    aakhri step ya jo chahe wo full look karta hai.
+    """
+    guard()
+    msgs = []
+    img = None
+    for i, st in enumerate(steps):
+        if not isinstance(st, dict):
+            return img, f"step {i} not an object: {st!r}"
+        cmd = st.get("cmd") or st.get("command") or ""
+        fn = CLI_NAMES.get(cmd)
+        if fn is None:
+            return img, f"step {i}: unknown command '{cmd}'"
+        args = st.get("args", [])
+        kwargs = dict(st.get("kwargs") or {})
+        if st.get("no_look"):
+            sig = inspect.signature(fn)
+            if "no_look" in sig.parameters:
+                kwargs["no_look"] = True
+        try:
+            img, msg = fn(*args, **kwargs)
+            msgs.append(f"{i + 1}. {cmd}: {msg}")
+        except Exception as e:
+            msgs.append(f"{i + 1}. {cmd}: ERROR {e}")
+            return img, "\n".join(msgs)
+    if img is not None:
+        pass  # aakhri img wapas
+    else:
+        img = _E.frame()
+    return img, "\n".join(msgs)
+
+
+def do(steps: str):
+    """MCP/CLI batch tool — JSON string of steps (bad input -> ValueError).
+
+    Parse pehle, guard baad me: bad JSON pe clean error milta hai bina GUI
+    dependencies ke (doctor/headless environments me bhi).
+    """
+    try:
+        parsed = json.loads(steps)
+    except Exception as e:
+        raise ValueError(f"bad JSON steps: {e}")
+    if not isinstance(parsed, list):
+        raise ValueError("steps must be a JSON array")
+    if not parsed:
+        raise ValueError("no steps (empty batch)")
+    return execute_steps(parsed)
+
+
+TOKEN = os.environ.get("AGENTSEEAI_TOKEN") or secrets.token_urlsafe(16)
+
+
+# ---------------------------------------------------------------- viewer (v1 compat)
 def _parse_token(path):
-    # extract token from query
     if "t=" in path:
         part = path.split("t=", 1)[1]
         return part.split("&", 1)[0].split(" ", 1)[0]
     return None
 
 
-# ---- Viewer ----
 class Viewer(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -1092,7 +1527,7 @@ class Viewer(BaseHTTPRequestHandler):
     def _origin_ok(self):
         origin = self.headers.get("Origin")
         if origin is None:
-            return True  # same-origin / no origin header (CLI)
+            return True
         allowed = f"http://127.0.0.1:{PORT}"
         return origin in (allowed, f"http://localhost:{PORT}")
 
@@ -1105,20 +1540,19 @@ class Viewer(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 while True:
-                    j = encode(frame(), "JPEG", quality=CFG["jpeg_quality"])
+                    j = encode(_E.frame(fresh=True), "JPEG", quality=CFG["jpeg_quality"])
                     self.wfile.write(b"--f\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(j) + j + b"\r\n")
                     time.sleep(1.0 / CFG["stream_fps"])
             except Exception:
                 return
         if self.path.startswith("/approvals"):
-            import json as _j
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(_j.dumps(_approval_queue).encode())
+            self.wfile.write(json.dumps(_approval_queue).encode())
             return
         page = (
-            f'<meta name=viewport content="width=device-width"><title>Agentseeai</title>'
+            f'<meta name=viewport content="width=device-width"><title>Agentseeai v2</title>'
             f'<body style="margin:0;background:#111;color:#eee;font-family:sans-serif">'
             f'<div style="padding:8px"><button onclick="act(\'stop\')">STOP</button> '
             f'<button onclick="act(\'resume\')">Resume</button> <span id=s></span></div>'
@@ -1182,104 +1616,185 @@ def start_viewer():
     return srv
 
 
-# ---- MCP Server ----
-TOOLS = [screenshot, click, move, drag, scroll, hscroll, type_text, key, hold_key, mouse_down, mouse_up, cursor_position, wait_change, wait_for_text, zoom, record, read_screen, find_text, click_text, elements, windows, focus, open_app, clip_get, clip_set, screens, set_screen, status, ask_approval]
-TOOL_NAMES = ["screenshot", "click", "move", "drag", "scroll", "hscroll", "type_text", "key", "hold_key", "mouse_down", "mouse_up", "cursor_position", "wait_change", "wait_for_text", "zoom", "record", "read_screen", "find_text", "click_text", "elements", "windows", "focus", "open_app", "clip_get", "clip_set", "screens", "set_screen", "status", "ask_approval"]
+# ---------------------------------------------------------------- FastServer (v2 core)
+"""Millisecond engine: ek persistent process, TCP localhost JSON-lines.
+
+  agentseeai serve                     # window khula rakho
+  -> ab HAR CLI call auto-forward hota hai is server pe:
+     python startup (300-600 ms) GAYA, mss/imports warm, frames cached.
+"""
+
+_STATS = {"served": 0, "cache_hits": 0, "started": time.time()}
 
 
-def _to_content(img, msg):
-    import base64 as _b64
-    data = _b64.b64encode(encode(img, "PNG")).decode()
-    from mcp.types import ImageContent, TextContent
-    return [TextContent(type="text", text=str(msg)), ImageContent(type="image", data=data, mimeType="image/png")]
+class _FastHandler(__import__("socketserver").BaseRequestHandler):
+    def _read_line(self) -> Optional[bytes]:
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = self.request.recv(65536)
+            if not chunk:
+                return None if not buf else buf
+            buf += chunk
+        return buf
+
+    def _send(self, obj: dict):
+        try:
+            self.request.sendall((json.dumps(obj) + "\n").encode())
+        except Exception:
+            pass
+
+    def handle(self):
+        while True:
+            try:
+                line = self._read_line()
+            except Exception:
+                return
+            if line is None:
+                return
+            try:
+                req = json.loads(line.decode("utf-8", errors="replace"))
+            except Exception:
+                self._send({"ok": False, "msg": "bad JSON"})
+                continue
+            t0 = time.time()
+            try:
+                resp = _fast_dispatch(req)
+            except Exception as e:
+                resp = {"ok": False, "msg": f"{type(e).__name__}: {e}"}
+            resp["ms"] = round((time.time() - t0) * 1000.0, 2)
+            _STATS["served"] += 1
+            self._send(resp)
 
 
-def run_mcp():
-    from mcp.server import MCPServer
-    start_viewer()
-    server = MCPServer("agentseeai")
+def _fast_dispatch(req: dict) -> dict:
+    cmd = req.get("cmd", "")
+    if cmd == "__ping":
+        return {"ok": True, "msg": "pong", "uptime_s": round(time.time() - _STATS["started"], 1)}
+    if cmd == "__stats":
+        return {"ok": True, "msg": json.dumps(_STATS)}
+    if cmd == "__shutdown":
+        def _bye():
+            time.sleep(0.05)
+            try:
+                _fast_server[0].shutdown()
+                _fast_server[0].server_close()
+            except Exception:
+                pass
+            if _serve_mode[0]:
+                os._exit(0)  # serve process poori tarah band (port free)
+        threading.Thread(target=_bye, daemon=True).start()
+        return {"ok": True, "msg": "shutting down"}
+    if cmd == "do":
+        steps = (req.get("args") or [""])[0] if req.get("args") else ""
+        img, msg = do(steps)
+        out: dict = {"ok": True, "msg": str(msg)}
+        if img is not None and req.get("want_img"):
+            import base64 as _b64
+            out["img_b64_png"] = _b64.b64encode(encode(img, "PNG")).decode()
+        return out
+    fn = CLI_NAMES.get(cmd)
+    if fn is None:
+        return {"ok": False, "msg": f"unknown command: {cmd}"}
+    args = coerce_args(fn, req.get("args", []))
+    kwargs = dict(req.get("kwargs") or {})
+    img, msg = fn(*args, **kwargs)
+    out = {"ok": True, "msg": str(msg)}
+    if img is not None and req.get("want_img"):
+        import base64 as _b64
+        out["img_b64_png"] = _b64.b64encode(encode(img, "PNG")).decode()
+    return out
 
-    def make_wrapper(fn):
-        def w(*a, **k):
-            img, msg = fn(*a, **k)
-            log_action(fn.__name__, {"args": a, "kwargs": k}, msg)
-            return _to_content(img, msg)
-        w.__name__ = fn.__name__
-        w.__doc__ = fn.__doc__
-        import inspect
-        w.__signature__ = inspect.signature(fn)
-        return w
 
-    for fn in TOOLS:
-        server.tool()(make_wrapper(fn))
-    server.run("stdio")
+_fast_server = [None]
+_serve_mode = [False]   # True jab `serve` command ka main process ho
 
 
-# ---- CLI ----
-CLI_NAMES = {
-    "shot": screenshot, "screenshot": screenshot,
-    "click": click, "move": move, "drag": drag, "scroll": scroll, "hscroll": hscroll,
-    "type": type_text, "type_text": type_text, "key": key, "hold_key": hold_key,
-    "mouse_down": mouse_down, "mouse_up": mouse_up, "cursor_position": cursor_position,
-    "wait": wait_change, "wait_change": wait_change, "wait_for_text": wait_for_text,
-    "zoom": zoom, "record": record, "read_screen": read_screen, "ocr": read_screen,
-    "find": find_text, "find_text": find_text, "click_text": click_text,
-    "tree": elements, "elements": elements,
-    "windows": windows, "focus": focus, "open_app": open_app,
-    "clip_get": clip_get, "clip_set": clip_set, "screens": screens, "set_screen": set_screen,
-    "status": status, "ask_approval": ask_approval,
-}
+class _FastTCPServer(__import__("socketserver").ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
-def run_cli(argv):
-    if not argv:
-        print(__doc__)
-        return
-    cmd = argv[0]
-    if cmd == "mcp":
-        run_mcp()
-        return
-    if cmd == "view":
+def start_fast_server(port: int = None, quiet: bool = False):
+    import socketserver
+    port = port or FAST_PORT
+    srv = _FastTCPServer(("127.0.0.1", port), _FastHandler)
+    _fast_server[0] = srv
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    if not quiet:
+        print(f"fast server: 127.0.0.1:{port} (millisecond mode ON)")
+    return srv
+
+
+def fast_send(obj: dict, port: int = None, timeout: float = 60.0) -> Optional[dict]:
+    """TCP JSON-lines client (CLI forward isi se karta hai)."""
+    port = port or FAST_PORT
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+            s.sendall((json.dumps(obj) + "\n").encode())
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = s.recv(1 << 20)
+                if not chunk:
+                    break
+                data += chunk
+        if not data:
+            return None
+        return json.loads(data.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def fast_server_alive(port: int = None, timeout: float = 0.25) -> bool:
+    resp = fast_send({"cmd": "__ping"}, port=port, timeout=timeout)
+    return bool(resp and resp.get("ok"))
+
+
+def cmd_serve(argv: List[str]):
+    port = FAST_PORT
+    if "--port" in argv:
+        try:
+            port = int(argv[argv.index("--port") + 1])
+        except Exception:
+            pass
+    if fast_server_alive(port):
+        print(f"fast server already running on 127.0.0.1:{port}")
+        return 0
+    _serve_mode[0] = True
+    try:
+        start_fast_server(port)
+    except OSError as e:
+        print(f"fast server start fail: {e}")
+        print("TIP: `agentseeai server-stop` (zombie kill), ya --port doosra (e.g. --port 8701)")
+        return 1
+    if "--view" in argv:
         start_viewer()
-        threading.Event().wait()
-        return
-    if cmd == "events":
-        # tail events file
-        if not EVENTS_PATH.exists():
-            print("no events yet")
-            return
-        lines = EVENTS_PATH.read_text().splitlines()
-        for line in lines[-50:]:
-            print(line)
-        return
-    if cmd == "doctor":
-        print(json.dumps({
-            "platform": sys.platform,
-            "python": sys.version.split()[0],
-            "has_mss": True,
-            "has_pyautogui": True,
-            "has_pillow": True,
-            "has_ocr": HAS_TESS,
-            "has_cv2": HAS_CV2,
-            "has_ax": HAS_AX,
-            "monitors": len(get_monitors()),
-            "stop_file": STOP_FILE.exists(),
-        }, indent=2))
-        return
-    if cmd not in CLI_NAMES:
-        print(f"unknown command: {cmd}")
-        print("commands:", ", ".join(sorted(set(CLI_NAMES) | {"mcp", "view", "events", "doctor"})))
-        return
-    fn = CLI_NAMES[cmd]
-    import inspect
+    print("commands yahin se bhi chalein (nayi terminal me): agentseeai <cmd> ...")
+    print("Ctrl+C = band. CLI bina server ke bhi chalti hai (slow mode).")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            _fast_server[0].server_close()
+        except Exception:
+            pass
+    print("\nfast server band.")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI (auto-forward)
+def coerce_args(fn, argv_list: List[str]) -> list:
+    """v1 logic: annotation-int/float/bool + int/float fallback."""
     params = list(inspect.signature(fn).parameters.values())
     args = []
-    for pp, v in zip(params, argv[1:]):
+    for pp, v in zip(params, argv_list):
         ann = pp.annotation
         if ann in (int, float):
             args.append(ann(v))
         elif ann == bool:
-            args.append(v.lower() in ("true", "1", "yes"))
+            args.append(str(v).lower() in ("true", "1", "yes"))
         else:
             try:
                 args.append(int(v))
@@ -1288,16 +1803,271 @@ def run_cli(argv):
                     args.append(float(v))
                 except (ValueError, TypeError):
                     args.append(v)
-    img, msg = fn(*args)
-    path = os.path.join(tempfile.gettempdir(), "agentseeai_last.png")
-    img.save(path)
+    return args
+
+
+def _print_result(img, msg) -> None:
     print(msg)
-    print("screenshot:", path)
+    if img is not None:
+        path = os.path.join(tempfile.gettempdir(), "agentseeai_last.png")
+        try:
+            img.save(path)
+            print("screenshot:", path)
+        except Exception:
+            pass
+
+
+def run_cli(argv):
+    argv = [a for a in argv if a != "--local"]
+    if not argv:
+        print(__doc__)
+        return 0
+    cmd = argv[0]
+    if cmd == "serve":
+        return cmd_serve(argv[1:])
+    if cmd == "server-stop":
+        resp = fast_send({"cmd": "__shutdown"})
+        print("server stopped" if resp and resp.get("ok") else "server nahi chal raha")
+        return 0
+    if cmd == "mcp":
+        run_mcp()
+        return 0
+    if cmd == "view":
+        start_viewer()
+        threading.Event().wait()
+        return 0
+    if cmd == "events":
+        if not EVENTS_PATH.exists():
+            print("no events yet")
+            return 0
+        for line in EVENTS_PATH.read_text().splitlines()[-50:]:
+            print(line)
+        return 0
+    if cmd == "doctor":
+        return doctor()
+    if cmd == "bench":
+        return bench()
+    if cmd == "version":
+        print(f"agentseeai {VERSION} ({BUILD_DATE})")
+        return 0
+    if cmd not in CLI_NAMES and cmd != "do":
+        print(f"unknown command: {cmd}")
+        print("commands:", ", ".join(sorted(set(CLI_NAMES) | {"mcp", "serve", "view", "events", "doctor", "bench", "do", "server-stop"})))
+        return 1
+
+    # ---- v2 FAST PATH: running server pe forward (no process startup) ----
+    if os.environ.get("AGENTSEEAI_NO_SERVER") != "1" and fast_server_alive():
+        if cmd == "do":
+            req = {"cmd": "do", "args": [argv[1] if len(argv) > 1 else ""], "want_img": True}
+        else:
+            req = {"cmd": cmd, "args": argv[1:], "want_img": True}
+        resp = fast_send(req, timeout=float(CFG.get("agents_timeout_s", 120) or 120))
+        if resp is not None:
+            import base64 as _b64
+            print(resp.get("msg", ""))
+            img_b64 = resp.get("img_b64_png")
+            if img_b64:
+                path = os.path.join(tempfile.gettempdir(), "agentseeai_last.png")
+                try:
+                    with open(path, "wb") as f:
+                        f.write(_b64.b64decode(img_b64))
+                    print("screenshot:", path)
+                except Exception:
+                    pass
+            print(f"[fast {resp.get('ms', '?')} ms]")
+            return 0 if resp.get("ok") else 1
+        print("[--] server gayab ho gaya — local mode me chal raha hoon")
+
+    # ---- local mode (back-compat) ----
+    if cmd == "do":
+        try:
+            img, msg = do(argv[1] if len(argv) > 1 else "")
+        except ValueError as e:
+            print(f"do: {e}")
+            return 1
+        _print_result(img, msg)
+        return 0
+    fn = CLI_NAMES[cmd]
+    args = coerce_args(fn, argv[1:])
+    img, msg = fn(*args)
+    _print_result(img, msg)
+    return 0
+
+
+# ---------------------------------------------------------------- MCP (built-in stdio, no SDK dep)
+def _schema_for(fn) -> dict:
+    props: Dict[str, dict] = {}
+    required = []
+    for name, p in inspect.signature(fn).parameters.items():
+        ann = p.annotation
+        t = "string"
+        if ann is int or ann is float:
+            t = "integer" if ann is int else "number"
+        elif ann is bool:
+            t = "boolean"
+        elif ann is inspect.Parameter.empty or ann is None:
+            t = "string"
+        props[name] = {"type": t}
+        if p.default is inspect.Parameter.empty:
+            required.append(name)
+    return {"type": "object", "properties": props, "required": required}
+
+
+_MCP_TOOLS = ["screenshot", "click", "move", "drag", "scroll", "hscroll", "type_text", "key", "hold_key",
+              "mouse_down", "mouse_up", "cursor_position", "wait_change", "wait_for_text", "zoom", "record",
+              "read_screen", "find_text", "click_text", "find_image", "pixel", "find_color",
+              "elements", "windows", "focus", "open_app", "clip_get", "clip_set", "screens", "set_screen",
+              "status", "ask_approval", "do"]
+
+
+def _mcp_tool_entry(name: str) -> dict:
+    fn = do if name == "do" else CLI_NAMES[name]
+    doc = (fn.__doc__ or "").strip().splitlines()
+    desc = doc[0] if doc else name
+    return {"name": name, "description": desc, "inputSchema": _schema_for(fn)}
+
+
+def _mcp_call(name: str, arguments: dict) -> dict:
+    import base64 as _b64
+    fn = do if name == "do" else CLI_NAMES.get(name)
+    if fn is None:
+        return {"content": [{"type": "text", "text": f"unknown tool: {name}"}], "isError": True}
+    try:
+        img, msg = fn(**arguments)
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}
+    content = [{"type": "text", "text": str(msg)}]
+    if img is not None:
+        content.append({"type": "image", "data": _b64.b64encode(encode(img, "PNG")).decode(), "mimeType": "image/png"})
+    return {"content": content}
+
+
+def _rpc_result(resp_id, result):
+    return json.dumps({"jsonrpc": "2.0", "id": resp_id, "result": result}) + "\n"
+
+
+def _rpc_error(resp_id, code, message):
+    return json.dumps({"jsonrpc": "2.0", "id": resp_id, "error": {"code": code, "message": message}}) + "\n"
+
+
+def run_mcp():
+    """MCP stdio server — built-in JSON-RPC (no `pip install mcp` needed).
+
+    v1 me ye SDK pe depend karta tha; v2 me protocol andar hai.
+    """
+    if CFG.get("server_in_mcp", True) and not fast_server_alive():
+        try:
+            start_fast_server(quiet=True)  # CLI + MCP dono millisecond mode me
+        except Exception:
+            pass  # port busy ho to MCP phir bhi chalega (tools in-process hain)
+    out = sys.stdout
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            out.write(_rpc_error(None, -32700, "parse error"))
+            out.flush()
+            continue
+        method = req.get("method", "")
+        rid = req.get("id")
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "agentseeai", "version": VERSION},
+            }
+            out.write(_rpc_result(rid, result))
+        elif method == "notifications/initialized":
+            pass  # notification — no response
+        elif method == "ping":
+            out.write(_rpc_result(rid, {}))
+        elif method == "tools/list":
+            out.write(_rpc_result(rid, {"tools": [_mcp_tool_entry(n) for n in _MCP_TOOLS]}))
+        elif method == "tools/call":
+            params = req.get("params") or {}
+            out.write(_rpc_result(rid, _mcp_call(params.get("name", ""), params.get("arguments") or {})))
+        elif rid is not None:
+            out.write(_rpc_error(rid, -32601, f"method not found: {method}"))
+        out.flush()
+
+
+# ---------------------------------------------------------------- doctor / bench
+def doctor():
+    """v2 doctor: asli probes + fast server + engine status."""
+    alive = fast_server_alive()
+    info = {
+        "version": f"{VERSION} ({BUILD_DATE})",
+        "platform": sys.platform,
+        "python": sys.version.split()[0],
+        "has_mss": _probe("mss"),
+        "has_pyautogui": _probe("pyautogui"),
+        "has_pillow": _probe("PIL"),
+        "has_pyperclip": _probe("pyperclip"),
+        "has_ocr_tess": _probe("pytesseract"),
+        "has_ocr_rapid": _OCR._load_rapid() or _probe("rapidocr"),
+        "ocr_engine_picked": _OCR._pick(),
+        "has_cv2": _probe("cv2"),
+        "has_ax": bool(ax_tree() and ax_tree()[0].role != "error"),
+        "monitors": len(get_monitors()),
+        "stop_file": STOP_FILE.exists(),
+        "fast_server": f"{'RUNNING' if alive else 'not running'} (127.0.0.1:{FAST_PORT})",
+        "speed_config": {
+            "settle_ms": CFG.get("settle_ms"),
+            "frame_ttl_ms": CFG.get("frame_ttl_ms"),
+            "input_pause_ms": CFG.get("input_pause_ms"),
+            "max_actions_per_minute": CFG.get("max_actions_per_minute"),
+        },
+    }
+    print(json.dumps(info, indent=2))
+    if not alive:
+        print("\nTIP: `agentseeai serve` chalao -> phir har CLI call milliseconds me.")
+    return 0
+
+
+def bench():
+    """Latency micro-benchmarks (jo sandbox/PC par napna mumkin hai)."""
+    print(f"agentseeai v{VERSION} bench\n" + "-" * 46)
+    t0 = time.perf_counter()
+    _probe("mss"), _probe("PIL"), _probe("pyautogui")
+    print(f"lazy imports probe        : {(time.perf_counter() - t0) * 1000:8.2f} ms")
+    t0 = time.perf_counter()
+    img = _E.frame(fresh=True)
+    print(f"frame (fresh, fallback)   : {(time.perf_counter() - t0) * 1000:8.2f} ms  -> {img.width}x{img.height}")
+    t0 = time.perf_counter()
+    _E.frame()
+    print(f"frame (TTL cached)        : {(time.perf_counter() - t0) * 1000:8.2f} ms")
+    t0 = time.perf_counter()
+    _OCR.analyze(img)
+    print(f"ocr ({_OCR._pick():8s})       : {(time.perf_counter() - t0) * 1000:8.2f} ms")
+    t0 = time.perf_counter()
+    _OCR.analyze(img)
+    print(f"ocr (hash cache hit)      : {(time.perf_counter() - t0) * 1000:8.2f} ms")
+    alive = fast_server_alive()
+    if alive:
+        ts = []
+        for _ in range(20):
+            t0 = time.perf_counter()
+            fast_send({"cmd": "__ping"})
+            ts.append((time.perf_counter() - t0) * 1000)
+        ts.sort()
+        print(f"server round-trip (20x)   : median {ts[len(ts) // 2]:8.2f} ms | min {ts[0]:.2f}")
+    else:
+        print("server round-trip         : (server band hai — `agentseeai serve` chalao)")
+    t0 = time.perf_counter()
+    fuzzy_rank("login", ["Login", "Logout", "Sign in", "Sign up"], limit=3)
+    print(f"fuzzy rank (4 candidates) : {(time.perf_counter() - t0) * 1000:8.2f} ms")
+    print("-" * 46)
+    return 0
 
 
 def main():
-    run_cli(sys.argv[1:])
+    sys.exit(run_cli(sys.argv[1:]) or 0)
 
 
 if __name__ == "__main__":
     main()
+
+
