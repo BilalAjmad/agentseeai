@@ -56,7 +56,7 @@ SCOPE (real desktop, no sandbox needed)
     - Not 60 fps video: agent thinking time is seconds per STEP,
       but each individual eye/hand operation is now milliseconds.
 """
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 __version__ = VERSION
 BUILD_DATE = "2026-11-21"
 
